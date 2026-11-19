@@ -1,4893 +1,3731 @@
-import json
-import copy
-import re
-import sys
-from pathlib import Path
-import shutil
-import tempfile
-from datetime import datetime
+"""Редактор босса, встроенный в правую панель."""
 
-from PySide6.QtGui import QIcon, QShortcut, QKeySequence, QFont, QFontDatabase
-from PySide6.QtCore import Qt, QSize, Signal, QTimer, QPointF
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QAction, QPen
+import copy
+
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QImage, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QFormLayout, QLineEdit, QComboBox, QSpinBox, QTabWidget,
-    QPushButton, QFileDialog, QMessageBox, QLabel, QGraphicsView,
-    QGraphicsScene, QGraphicsPixmapItem, QColorDialog, QSplitter,
-    QListWidget, QListWidgetItem, QInputDialog, QCheckBox, QDoubleSpinBox,
-    QAbstractSpinBox, QTextEdit, QPlainTextEdit, QFrame
+    QAbstractItemView,
+    QCheckBox,
+    QColorDialog,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QGridLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSpinBox,
+    QTableWidget,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .animation import AnimationEditor
+from .boss_preview import BossPreview
+from .canvas import opaque_bounds
+from .scripting import ScriptEditor
+from .theme import THEME, make_scroll_form_tab, section_label
+
+
+# Способы поведения, которые генератор умеет собирать в C#-код.
+BOSS_AI_OPTIONS = (
+    ("Парение над игроком", "hover"),
+    ("Прыжки по земле", "jump"),
+    ("Рывки и паузы", "charge"),
+    ("Кружит вокруг игрока", "orbit"),
+    ("Телепортация к игроку", "teleport"),
+)
+
+BOSS_AI_LABELS = {
+    code: label for label, code in BOSS_AI_OPTIONS
+}
+BOSS_AI_CODES = frozenset(BOSS_AI_LABELS)
+
+# Что делает каждое поведение — эти тексты видит пользователь.
+BOSS_AI_DESCRIPTIONS = {
+    "hover": (
+        "Босс держится на заданной высоте над игроком и плавно догоняет "
+        "его. Не проваливается сквозь блоки."
+    ),
+    "jump": (
+        "Босс бежит по земле в сторону игрока и прыгает, когда оказывается "
+        "рядом. Учитывает блоки и гравитацию."
+    ),
+    "charge": (
+        "Босс замирает, прицеливается и резко бросается на игрока, затем "
+        "снова замирает. Летает сквозь блоки, как Око Ктулху."
+    ),
+    "orbit": (
+        "Босс кружит вокруг игрока по кругу заданного радиуса. Хорошо "
+        "сочетается со спиральными выстрелами."
+    ),
+    "teleport": (
+        "Босс периодически исчезает и появляется рядом с игроком, а между "
+        "телепортами медленно подплывает к нему."
+    ),
+}
+
+# Состояния, для которых можно нарисовать отдельную ленту кадров.
+BOSS_ANIMATION_STATES = (
+    ("idle", "Покой"),
+    ("move", "Движение"),
+    ("attack", "Атака"),
+    ("jump", "Прыжок"),
+)
+
+BOSS_ANIMATION_STATE_IDS = {
+    state: index
+    for index, (state, _label) in enumerate(BOSS_ANIMATION_STATES)
+}
+
+# Ванильная музыка, которую можно назначить боссу.
+BOSS_MUSIC_OPTIONS = (
+    ("Как у обычного босса", ""),
+    ("Boss 1", "Boss1"),
+    ("Boss 2", "Boss2"),
+    ("Boss 3", "Boss3"),
+    ("Boss 4", "Boss4"),
+    ("Boss 5", "Boss5"),
+    ("Eerie", "Eerie"),
+)
+
+# Дебаффы для иммунитетов и накладывания при касании.
+BOSS_BUFF_OPTIONS = (
+    ("Огонь", "OnFire"),
+    ("Яд", "Poisoned"),
+    ("Кровотечение", "Bleeding"),
+    ("Замедление", "Slow"),
+    ("Слабость", "Weak"),
+    ("Замешательство", "Confused"),
+    ("Проклятое пламя", "CursedInferno"),
+    ("Ихор", "Ichor"),
+    ("Обморожение", "Frostburn"),
+    ("Ядовитый укус", "Venom"),
+    ("Темнота", "Darkness"),
+    ("Немота", "Silenced"),
+    ("Проклятие", "Cursed"),
+    ("Разрушенная броня", "BrokenArmor"),
+    ("Электризация", "Electrified"),
+    ("Озноб", "Chilled"),
+    ("Паутина", "Webbed"),
+    ("Окаменение", "Stoned"),
+    ("Горение", "Burning"),
+    ("Теневое пламя", "ShadowFlame"),
+    ("Ошеломление", "Dazed"),
+)
+
+BOSS_BUFF_CODES = frozenset(code for _label, code in BOSS_BUFF_OPTIONS)
+
+# Готовые ванильные снаряды для дальней атаки.
+BOSS_PROJECTILE_OPTIONS = (
+    ("Демоническая коса", "DemonScythe"),
+    ("Проклятое пламя", "CursedFlameHostile"),
+    ("Лазер смерти", "DeathLaser"),
+    ("Глазной лазер", "EyeLaser"),
+    ("Тёмный луч", "ShadowBeamHostile"),
+    ("Ледяной залп", "FrostBlastHostile"),
+    ("Огненный глаз", "EyeFire"),
+    ("Рунный взрыв", "RuneBlast"),
+    ("Розовый лазер", "PinkLaser"),
+    ("Нечестивый трезубец", "UnholyTridentHostile"),
+    ("Демонический серп", "DemonSickle"),
+    ("Бомба Скелетрона", "BombSkeletronPrime"),
+    ("Блуждающая душа", "LostSoulHostile"),
+)
+
+BOSS_PROJECTILE_CODES = frozenset(
+    code for _label, code in BOSS_PROJECTILE_OPTIONS
+)
+
+# Узоры стрельбы. Разброс в узорах используется по-разному.
+BOSS_SHOOT_PATTERNS = (
+    ("Веер в игрока", "fan"),
+    ("Круг во все стороны", "radial"),
+    ("Спираль", "spiral"),
+)
+
+BOSS_SHOOT_PATTERN_CODES = frozenset(
+    code for _label, code in BOSS_SHOOT_PATTERNS
+)
+
+BOSS_SHOOT_PATTERN_LABELS = {
+    code: label for label, code in BOSS_SHOOT_PATTERNS
+}
+
+# Откуда берётся снаряд: ванильный ID или собственный класс от TMC.
+BOSS_SHOOT_SOURCES = (
+    ("Ванильный снаряд", "vanilla"),
+    ("Свой снаряд (TMC создаст класс)", "custom"),
+)
+
+BOSS_SHOOT_SOURCE_CODES = frozenset(
+    code for _label, code in BOSS_SHOOT_SOURCES
+)
+
+# Ингредиенты для рецепта предмета-призыва.
+BOSS_RECIPE_INGREDIENTS = (
+    ("Гель", "Gel"),
+    ("Линза", "Lens"),
+    ("Кость", "Bone"),
+    ("Перо", "Feather"),
+    ("Гнилой кусок", "RottenChunk"),
+    ("Позвонок", "Vertebra"),
+    ("Дерево", "Wood"),
+    ("Факел", "Torch"),
+    ("Серебряный слиток", "SilverBar"),
+    ("Золотой слиток", "GoldBar"),
+    ("Демонитовый слиток", "DemoniteBar"),
+    ("Кримтановый слиток", "CrimtaneBar"),
+    ("Святой слиток", "HallowedBar"),
+    ("Адамантитовый слиток", "AdamantiteBar"),
+    ("Титановый слиток", "TitaniumBar"),
+    ("Душа света", "SoulofLight"),
+    ("Душа ночи", "SoulofNight"),
+)
+
+BOSS_RECIPE_INGREDIENT_CODES = frozenset(
+    code for _label, code in BOSS_RECIPE_INGREDIENTS
+)
+
+# Станции для рецепта призыва.
+BOSS_RECIPE_STATIONS = (
+    ("Без станции", ""),
+    ("Верстак", "WorkBenches"),
+    ("Наковальня", "Anvils"),
+    ("Печь", "Furnaces"),
+    ("Демонический алтарь", "DemonAltar"),
+    ("Книжная полка", "Bookcases"),
+)
+
+BOSS_RECIPE_STATION_CODES = frozenset(
+    code for _label, code in BOSS_RECIPE_STATIONS
+)
+
+# Кого босс может призывать в бою: готовые ванильные NPC.
+BOSS_SUMMON_NPC_OPTIONS = (
+    ("Зомби", "Zombie"),
+    ("Демонический глаз", "DemonEye"),
+    ("Слизень", "BlueSlime"),
+    ("Скелет", "Skeleton"),
+    ("Шершень", "Hornet"),
+    ("Пещерная мышь", "CaveBat"),
+    ("Гарпия", "Harpy"),
+    ("Кримера", "Crimera"),
+    ("Пожиратель душ", "EaterofSouls"),
+    ("Розовый слизень", "Pinky"),
+    ("Лицо-монстр", "FaceMonster"),
+)
+
+BOSS_SUMMON_NPC_CODES = frozenset(
+    code for _label, code in BOSS_SUMMON_NPC_OPTIONS
+)
+
+# Старые данные TMC: «Slime» в Terraria называется BlueSlime.
+BOSS_SUMMON_NPC_ALIASES = {
+    "Slime": "BlueSlime",
+}
+
+
+def normalize_adds_npc(value):
+    """Приводит ID моба призыва к известному или возвращает пустую строку."""
+
+    code = str(value or "")
+    code = BOSS_SUMMON_NPC_ALIASES.get(code, code)
+
+    return code if code in BOSS_SUMMON_NPC_CODES else ""
+
+MAX_BOSS_PHASES = 8
+
+DEFAULT_DASH = {
+    "enabled": False,
+    "interval_ticks": 300,
+    "speed": 18.0,
+    "duration_ticks": 30,
+    "expert_only": False,
+}
+
+DEFAULT_SHOOT = {
+    "enabled": False,
+    "interval_ticks": 180,
+    "pattern": "fan",
+    "source": "vanilla",
+    "projectile": "DemonScythe",
+    "damage": 20,
+    "count": 3,
+    "spread_degrees": 12.0,
+    "speed": 8.0,
+    "spiral_step": 20.0,
+    "color": "#ff9b3d",
+    "radius": 12,
+    "homing": 0.0,
+    "pierce": 1,
+    "lifetime_ticks": 300,
+    "expert_only": False,
+}
+
+DEFAULT_CONTACT_BUFF = {
+    "enabled": False,
+    "buff": "OnFire",
+    "duration_ticks": 300,
+}
+
+DEFAULT_SUMMON_RECIPE = {
+    "enabled": False,
+    "item": "Gel",
+    "count": 5,
+    "station": "WorkBenches",
+}
+
+# Призыв мобов во время боя.
+DEFAULT_ADD_ATTACK = {
+    "enabled": False,
+    "interval_ticks": 600,
+    "npc": "Zombie",
+    "count": 1,
+    "expert_only": False,
+}
+
+DEFAULT_PHASE = {
+    "name": "Фаза 1",
+    "threshold": 1.0,
+    "speed_multiplier": 1.0,
+    "attack_multiplier": 1.0,
+}
+
+# Начальные боевые параметры нового босса.
+DEFAULT_BOSS_STATS = {
+    "life_max": 4000,
+    "damage": 30,
+    "defense": 10,
+    "knockback_resist": 0.0,
+    "width": 100,
+    "height": 100,
+    "scale": 1.0,
+    "value_copper": 100000,
+    "ai": "hover",
+    "movement_speed": 6.0,
+    "hover_height": 180,
+    "jump_force": 10.0,
+    "orbit_radius": 260,
+    "orbit_speed": 1.5,
+    "teleport_interval": 240,
+    "teleport_range": 320,
+    "charge_speed": 16.0,
+    "charge_pause": 90,
+    "expert_life_percent": 100,
+    "master_life_percent": 100,
+}
+
+# Готовые образы боссов: заполняют характеристики и атаки одним нажатием.
+BOSS_TEMPLATES = (
+    {
+        "title": "Король слизней — прыжки",
+        "hint": (
+            "Классический прыгающий босс: много здоровья, мягкие прыжки, "
+            "без дальних атак. Хорошая основа для первого босса."
+        ),
+        "music": "Boss1",
+        "stats": {
+            "life_max": 2000,
+            "damage": 24,
+            "defense": 6,
+            "knockback_resist": 0.0,
+            "width": 120,
+            "height": 90,
+            "scale": 1.6,
+            "value_copper": 50000,
+            "ai": "jump",
+            "movement_speed": 4.5,
+            "jump_force": 9.5,
+        },
+        "actions": {
+            "dash": {"enabled": False},
+            "shoot": {"enabled": False},
+        },
+    },
+    {
+        "title": "Око Ктулху — парение и рывки",
+        "hint": (
+            "Летающий босс держится над игроком и периодически бросается "
+            "в него. Анимация «Атака» включается на время рывка."
+        ),
+        "music": "Boss1",
+        "stats": {
+            "life_max": 2800,
+            "damage": 24,
+            "defense": 4,
+            "knockback_resist": 0.1,
+            "width": 80,
+            "height": 80,
+            "scale": 1.0,
+            "value_copper": 80000,
+            "ai": "hover",
+            "movement_speed": 8.0,
+            "hover_height": 150,
+        },
+        "actions": {
+            "dash": {
+                "enabled": True,
+                "interval_ticks": 210,
+                "speed": 15.0,
+                "duration_ticks": 24,
+            },
+            "shoot": {"enabled": False},
+        },
+    },
+    {
+        "title": "Пожиратель — таранные броски",
+        "hint": (
+            "Босс замирает, целится и летит напролом. Между рывками "
+            "медленно подкрадывается к игроку."
+        ),
+        "music": "Boss2",
+        "stats": {
+            "life_max": 4200,
+            "damage": 30,
+            "defense": 8,
+            "knockback_resist": 0.0,
+            "width": 100,
+            "height": 60,
+            "scale": 1.0,
+            "value_copper": 90000,
+            "ai": "charge",
+            "movement_speed": 6.0,
+            "charge_speed": 13.0,
+            "charge_pause": 100,
+        },
+        "actions": {
+            "dash": {"enabled": False},
+            "shoot": {"enabled": False},
+        },
+    },
+    {
+        "title": "Колдун — телепорт и кольцо снарядов",
+        "hint": (
+            "Босс исчезает и появляется рядом, выпуская снаряды во все "
+            "стороны. Хорошо смотрится с рунным взрывом или тёмным лучом."
+        ),
+        "music": "Boss3",
+        "stats": {
+            "life_max": 3200,
+            "damage": 28,
+            "defense": 10,
+            "knockback_resist": 0.2,
+            "width": 60,
+            "height": 90,
+            "scale": 1.0,
+            "value_copper": 120000,
+            "ai": "teleport",
+            "movement_speed": 5.0,
+            "hover_height": 120,
+            "teleport_interval": 240,
+            "teleport_range": 300,
+        },
+        "actions": {
+            "dash": {"enabled": False},
+            "shoot": {
+                "enabled": True,
+                "interval_ticks": 210,
+                "pattern": "radial",
+                "source": "vanilla",
+                "projectile": "RuneBlast",
+                "damage": 22,
+                "count": 8,
+                "speed": 7.0,
+                "spread_degrees": 45.0,
+            },
+            "summon": {
+                "enabled": True,
+                "interval_ticks": 600,
+                "npc": "CaveBat",
+                "count": 2,
+            },
+        },
+    },
+    {
+        "title": "Небесный страж — орбита и спираль",
+        "hint": (
+            "Босс кружит вокруг игрока и раскручивает спираль снарядов. "
+            "Две фазы: на половине здоровья становится быстрее и злее."
+        ),
+        "music": "Boss4",
+        "stats": {
+            "life_max": 6000,
+            "damage": 36,
+            "defense": 14,
+            "knockback_resist": 0.0,
+            "width": 90,
+            "height": 90,
+            "scale": 1.3,
+            "value_copper": 200000,
+            "ai": "orbit",
+            "movement_speed": 5.0,
+            "orbit_radius": 280,
+            "orbit_speed": 1.4,
+        },
+        "actions": {
+            "dash": {"enabled": False},
+            "shoot": {
+                "enabled": True,
+                "interval_ticks": 150,
+                "pattern": "spiral",
+                "source": "vanilla",
+                "projectile": "ShadowBeamHostile",
+                "damage": 26,
+                "count": 4,
+                "spread_degrees": 18.0,
+                "spiral_step": 23.0,
+                "speed": 8.0,
+            },
+        },
+        "phases": [
+            {"name": "Фаза 1", "threshold": 1.0,
+             "speed_multiplier": 1.0, "attack_multiplier": 1.0},
+            {"name": "Фаза 2", "threshold": 0.5,
+             "speed_multiplier": 1.25, "attack_multiplier": 1.4},
+        ],
+    },
+    {
+        "title": "Древний страж — свой снаряд",
+        "hint": (
+            "Показывает собственный снаряд TMC: светящийся шар с лёгким "
+            "самонаведением, три фазы и мощный рывок. Нужен спрайт босса."
+        ),
+        "music": "Boss5",
+        "stats": {
+            "life_max": 9000,
+            "damage": 48,
+            "defense": 24,
+            "knockback_resist": 0.0,
+            "width": 110,
+            "height": 110,
+            "scale": 1.5,
+            "value_copper": 400000,
+            "ai": "hover",
+            "movement_speed": 7.0,
+            "hover_height": 200,
+        },
+        "actions": {
+            "dash": {
+                "enabled": True,
+                "interval_ticks": 300,
+                "speed": 18.0,
+                "duration_ticks": 30,
+            },
+            "shoot": {
+                "enabled": True,
+                "interval_ticks": 150,
+                "pattern": "fan",
+                "source": "custom",
+                "projectile": "DemonScythe",
+                "damage": 40,
+                "count": 5,
+                "spread_degrees": 14.0,
+                "speed": 9.0,
+                "color": "#8a6bff",
+                "radius": 14,
+                "homing": 0.04,
+                "pierce": 2,
+                "lifetime_ticks": 360,
+            },
+            "summon": {
+                "enabled": True,
+                "interval_ticks": 480,
+                "npc": "Harpy",
+                "count": 2,
+                "expert_only": True,
+            },
+        },
+        "phases": [
+            {"name": "Фаза 1", "threshold": 1.0,
+             "speed_multiplier": 1.0, "attack_multiplier": 1.0},
+            {"name": "Фаза 2", "threshold": 0.6,
+             "speed_multiplier": 1.15, "attack_multiplier": 1.25},
+            {"name": "Фаза 3", "threshold": 0.3,
+             "speed_multiplier": 1.35, "attack_multiplier": 1.6},
+        ],
+    },
 )
 
 
 # ============================================================
-# PIXEL CANVAS
+# НОРМАЛИЗАЦИЯ ДАННЫХ
 # ============================================================
 
 
-# ============================================================
-# THEME
-# ============================================================
-#
-# Палитра: тёмный «ночной» синеватый фон и один акцент — золотая монета
-# (как в Terraria, где цена предмета считается в монетах). Второй цвет
-# интерфейса — цвет редкости предмета: его видно в списке и в карточке.
+def _as_dict(value):
+    return value if isinstance(value, dict) else {}
 
-THEME = {
-    "bg": "#14171c",
-    "panel": "#1a1e25",
-    "raised": "#212630",
-    "field": "#1d222a",
-    "line": "#2c333e",
-    "line_hover": "#455264",
-    "text": "#e4e8ee",
-    "muted": "#8a95a5",
-    "accent": "#e2b04a",
-    "accent_hover": "#edc269",
-    "accent_press": "#c99b3a",
-    "accent_ink": "#1c1608",
-    "accent_dim": "#2e2718",
-    "select": "#263040",
-    "danger": "#ff8f86",
-}
 
-# Цвета редкости из Terraria (совпадают с тем, во что их превращает генератор).
-RARITY_COLORS = {
-    "Обычная": "#e4e8ee",
-    "Необычная": "#9696ff",
-    "Редкая": "#96ff96",
-    "Очень редкая": "#ffc896",
-    "Эпическая": "#ff9696",
-    "Легендарная": "#ffff0a",
-}
+def _as_list(value):
+    return value if isinstance(value, list) else []
 
-DAMAGE_TYPE_NAMES = {
-    "Melee": "ближнего боя",
-    "Ranged": "дальнего боя",
-    "Magic": "магического",
-    "Summon": "призыва",
-    "Generic": "",
-}
 
+def _clamped_int(value, default, minimum, maximum):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = int(default)
 
-def build_ui_assets():
-    """Рисует маленькие значки для стрелок и галочки; возвращает папку."""
+    return max(minimum, min(maximum, number))
 
-    folder = Path(tempfile.gettempdir()) / "tmc_ui_assets"
-    folder.mkdir(parents=True, exist_ok=True)
 
-    def draw(name, points, color, size=12, width=1.7):
-        image = QImage(size, size, QImage.Format.Format_ARGB32)
-        image.fill(Qt.GlobalColor.transparent)
+def _clamped_float(value, default, minimum, maximum):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = float(default)
 
-        painter = QPainter(image)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    if number != number:  # NaN
+        number = float(default)
 
-        pen = QPen(QColor(color))
-        pen.setWidthF(width)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
-        painter.drawPolyline([QPointF(x, y) for x, y in points])
-        painter.end()
+    return max(minimum, min(maximum, number))
 
-        image.save(str(folder / name))
 
-    muted = THEME["muted"]
-    draw("arrow_up.png", [(3, 7.5), (6, 4.5), (9, 7.5)], muted)
-    draw("arrow_down.png", [(3, 4.5), (6, 7.5), (9, 4.5)], muted)
-    draw("arrow_up_hover.png", [(3, 7.5), (6, 4.5), (9, 7.5)], THEME["text"])
-    draw("arrow_down_hover.png", [(3, 4.5), (6, 7.5), (9, 4.5)], THEME["text"])
-    draw(
-        "check.png",
-        [(3.5, 8), (6.5, 11), (12, 4.5)],
-        THEME["accent_ink"],
-        size=16,
-        width=2.0
-    )
+def normalize_boss_phases(value):
+    """Фазы босса в безопасном виде: первая всегда 100%, пороги убывают."""
 
-    return folder.as_posix()
+    phases = []
 
+    for entry in _as_list(value):
+        if not isinstance(entry, dict):
+            continue
 
-def build_logo_pixmap(scale=5):
-    """Логотип TMC: буква T из пикселей с мягкой тенью."""
+        name = str(entry.get("name") or "").strip()
 
-    grid = 6
-    image = QImage(grid, grid, QImage.Format.Format_ARGB32)
-    image.fill(Qt.GlobalColor.transparent)
+        phases.append({
+            "name": name or f"Фаза {len(phases) + 1}",
+            "threshold": _clamped_float(
+                entry.get("threshold"), 1.0, 0.0, 1.0
+            ),
+            "speed_multiplier": _clamped_float(
+                entry.get("speed_multiplier"), 1.0, 0.1, 5.0
+            ),
+            "attack_multiplier": _clamped_float(
+                entry.get("attack_multiplier"), 1.0, 0.1, 5.0
+            ),
+        })
 
-    letter = {(x, 0) for x in range(5)} | {(2, y) for y in range(1, 5)}
-    shadow = QColor("#7a5d1f")
-    gold = QColor(THEME["accent"])
+    if not phases:
+        phases = [dict(DEFAULT_PHASE)]
 
-    for x, y in letter:
-        if x + 1 < grid and y + 1 < grid and (x + 1, y + 1) not in letter:
-            image.setPixelColor(x + 1, y + 1, shadow)
+    phases = phases[:MAX_BOSS_PHASES]
+    phases[0]["threshold"] = 1.0
 
-    for x, y in letter:
-        image.setPixelColor(x, y, gold)
+    previous = 1.0
 
-    return QPixmap.fromImage(image).scaled(
-        grid * scale, grid * scale,
-        Qt.AspectRatioMode.KeepAspectRatio,
-        Qt.TransformationMode.FastTransformation
-    )
+    for phase in phases[1:]:
+        phase["threshold"] = max(
+            0.0, min(phase["threshold"], round(previous - 0.01, 4))
+        )
+        previous = phase["threshold"]
 
+    return phases
 
-def section_label(text):
-    label = QLabel(text)
-    label.setObjectName("sectionTitle")
-    return label
 
+def boss_frame_count(animations):
+    """Сколько всего кадров во всех состояниях босса."""
 
-def style_form(form):
-    form.setLabelAlignment(
-        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-    )
-    form.setFieldGrowthPolicy(
-        QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
-    )
-    form.setHorizontalSpacing(22)
-    form.setVerticalSpacing(10)
-    form.setContentsMargins(14, 14, 14, 14)
+    total = 0
 
-
-def make_form_tab(max_width=700):
-    """Вкладка с формой, которая не растягивается на весь экран."""
-
-    tab = QWidget()
-    outer = QHBoxLayout(tab)
-
-    host = QWidget()
-    host.setMaximumWidth(max_width)
-    form = QFormLayout(host)
-    style_form(form)
-
-    outer.addWidget(host, 1, Qt.AlignmentFlag.AlignTop)
-    outer.addStretch(1)
-
-    return tab, form
-
-
-def build_stylesheet(assets):
-    t = THEME
-
-    return f"""
-        QMainWindow, QWidget {{
-            background-color: {t["bg"]};
-            color: {t["text"]};
-            font-size: 10pt;
-            selection-background-color: {t["accent_dim"]};
-            selection-color: {t["accent_hover"]};
-        }}
-        QLabel {{
-            background: transparent;
-        }}
-        QLabel#sectionTitle {{
-            color: {t["muted"]};
-            font-weight: 700;
-            padding: 6px 0 2px 0;
-        }}
-        QLabel#hint {{
-            color: {t["muted"]};
-            padding: 4px 2px;
-        }}
-        QLabel#appTitle {{
-            font-size: 17pt;
-            font-weight: 800;
-            color: {t["text"]};
-        }}
-        QLabel#appSubtitle, QLabel#projectLabel {{
-            color: {t["muted"]};
-        }}
-
-        QMenuBar {{
-            background-color: {t["bg"]};
-            color: {t["text"]};
-            padding: 3px 8px;
-        }}
-        QMenuBar::item {{
-            background: transparent;
-            padding: 6px 12px;
-            border-radius: 6px;
-        }}
-        QMenuBar::item:selected {{
-            background-color: {t["raised"]};
-        }}
-        QMenu {{
-            background-color: {t["raised"]};
-            border: 1px solid {t["line_hover"]};
-            border-radius: 8px;
-            padding: 6px;
-        }}
-        QMenu::item {{
-            padding: 8px 26px;
-            border-radius: 5px;
-        }}
-        QMenu::item:selected {{
-            background-color: {t["select"]};
-        }}
-        QMenu::separator {{
-            height: 1px;
-            background: {t["line"]};
-            margin: 5px 8px;
-        }}
-
-        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox,
-        QPlainTextEdit, QTextEdit {{
-            background-color: {t["field"]};
-            color: {t["text"]};
-            border: 1px solid {t["line"]};
-            border-radius: 7px;
-            padding: 7px 10px;
-            min-height: 20px;
-        }}
-        QLineEdit:hover, QComboBox:hover, QSpinBox:hover,
-        QDoubleSpinBox:hover, QPlainTextEdit:hover, QTextEdit:hover {{
-            border-color: {t["line_hover"]};
-        }}
-        QLineEdit:focus, QComboBox:focus, QSpinBox:focus,
-        QDoubleSpinBox:focus, QPlainTextEdit:focus, QTextEdit:focus {{
-            border: 1px solid {t["accent"]};
-        }}
-        QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
-            color: {t["muted"]};
-        }}
-
-        QSpinBox, QDoubleSpinBox {{
-            padding-right: 26px;
-        }}
-        QSpinBox::up-button, QDoubleSpinBox::up-button {{
-            subcontrol-origin: border;
-            subcontrol-position: top right;
-            width: 22px;
-            border: none;
-            border-left: 1px solid {t["line"]};
-            border-top-right-radius: 7px;
-            background: {t["raised"]};
-        }}
-        QSpinBox::down-button, QDoubleSpinBox::down-button {{
-            subcontrol-origin: border;
-            subcontrol-position: bottom right;
-            width: 22px;
-            border: none;
-            border-left: 1px solid {t["line"]};
-            border-top: 1px solid {t["line"]};
-            border-bottom-right-radius: 7px;
-            background: {t["raised"]};
-        }}
-        QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
-        QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
-            background: {t["select"]};
-        }}
-        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
-            image: url({assets}/arrow_up.png);
-            width: 10px;
-            height: 10px;
-        }}
-        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
-            image: url({assets}/arrow_down.png);
-            width: 10px;
-            height: 10px;
-        }}
-        QSpinBox::up-arrow:hover, QDoubleSpinBox::up-arrow:hover {{
-            image: url({assets}/arrow_up_hover.png);
-        }}
-        QSpinBox::down-arrow:hover, QDoubleSpinBox::down-arrow:hover {{
-            image: url({assets}/arrow_down_hover.png);
-        }}
-
-        QComboBox {{
-            padding-right: 30px;
-        }}
-        QComboBox::drop-down {{
-            subcontrol-origin: padding;
-            subcontrol-position: top right;
-            width: 28px;
-            border: none;
-            border-left: 1px solid {t["line"]};
-            border-top-right-radius: 7px;
-            border-bottom-right-radius: 7px;
-            background: {t["raised"]};
-        }}
-        QComboBox::down-arrow {{
-            image: url({assets}/arrow_down.png);
-            width: 10px;
-            height: 10px;
-        }}
-        QComboBox QAbstractItemView {{
-            background-color: {t["raised"]};
-            color: {t["text"]};
-            border: 1px solid {t["line_hover"]};
-            border-radius: 6px;
-            selection-background-color: {t["select"]};
-            selection-color: #ffffff;
-            padding: 4px;
-            outline: 0;
-        }}
-
-        QListWidget {{
-            selection-color: #ffffff;
-            background-color: {t["field"]};
-            border: 1px solid {t["line"]};
-            border-radius: 8px;
-            padding: 6px;
-            outline: 0;
-        }}
-        QListWidget::item {{
-            padding: 7px 8px;
-            margin: 2px 0;
-            border-radius: 6px;
-            border-left: 3px solid transparent;
-        }}
-        QListWidget::item:hover {{
-            background-color: {t["raised"]};
-        }}
-        QListWidget::item:selected {{
-            background-color: {t["select"]};
-            border-left: 3px solid {t["accent"]};
-        }}
-
-        QPushButton {{
-            background-color: {t["raised"]};
-            color: {t["text"]};
-            border: 1px solid {t["line"]};
-            border-radius: 7px;
-            padding: 8px 14px;
-            min-height: 20px;
-        }}
-        QPushButton:hover {{
-            background-color: {t["select"]};
-            border-color: {t["line_hover"]};
-        }}
-        QPushButton:pressed {{
-            background-color: {t["field"]};
-        }}
-        QPushButton:disabled {{
-            background-color: {t["panel"]};
-            color: #5c6675;
-            border-color: {t["line"]};
-        }}
-        QPushButton:checked {{
-            background-color: {t["accent_dim"]};
-            border-color: {t["accent"]};
-            color: {t["accent_hover"]};
-        }}
-        QPushButton:focus {{
-            border-color: {t["line_hover"]};
-        }}
-        QPushButton[accent="true"] {{
-            color: {t["accent"]};
-            border-color: #5b4a22;
-        }}
-        QPushButton[accent="true"]:hover {{
-            background-color: {t["accent_dim"]};
-            border-color: {t["accent"]};
-        }}
-        QPushButton[primary="true"] {{
-            background-color: {t["accent"]};
-            color: {t["accent_ink"]};
-            border: 1px solid {t["accent"]};
-            font-weight: 700;
-            padding: 9px 22px;
-        }}
-        QPushButton[primary="true"]:hover {{
-            background-color: {t["accent_hover"]};
-            border-color: {t["accent_hover"]};
-        }}
-        QPushButton[primary="true"]:pressed {{
-            background-color: {t["accent_press"]};
-        }}
-        QPushButton[danger="true"]:hover {{
-            background-color: #2b1f22;
-            border-color: #7a3b3b;
-            color: {t["danger"]};
-        }}
-        QPushButton[danger="true"]:disabled {{
-            color: #5c6675;
-        }}
-
-        QTabWidget::pane {{
-            background-color: transparent;
-            border: none;
-            border-top: 1px solid {t["line"]};
-            top: -1px;
-        }}
-        QTabBar {{
-            background: transparent;
-        }}
-        QTabBar::tab {{
-            background: transparent;
-            color: {t["muted"]};
-            padding: 10px 16px;
-            margin-right: 2px;
-            border: none;
-            border-bottom: 2px solid transparent;
-        }}
-        QTabBar::tab:hover {{
-            color: {t["text"]};
-        }}
-        QTabBar::tab:selected {{
-            color: #ffffff;
-            font-weight: 600;
-            border-bottom: 2px solid {t["accent"]};
-        }}
-
-        QCheckBox {{
-            spacing: 9px;
-            background: transparent;
-        }}
-        QCheckBox::indicator {{
-            width: 17px;
-            height: 17px;
-            border-radius: 5px;
-            border: 1px solid {t["line_hover"]};
-            background-color: {t["field"]};
-        }}
-        QCheckBox::indicator:hover {{
-            border-color: {t["accent"]};
-        }}
-        QCheckBox::indicator:checked {{
-            background-color: {t["accent"]};
-            border-color: {t["accent"]};
-            image: url({assets}/check.png);
-        }}
-
-        QScrollBar:vertical {{
-            background: transparent;
-            width: 12px;
-            margin: 2px;
-        }}
-        QScrollBar::handle:vertical {{
-            background: {t["line"]};
-            min-height: 28px;
-            border-radius: 4px;
-            margin: 0 2px;
-        }}
-        QScrollBar::handle:vertical:hover {{
-            background: {t["line_hover"]};
-        }}
-        QScrollBar:horizontal {{
-            background: transparent;
-            height: 12px;
-            margin: 2px;
-        }}
-        QScrollBar::handle:horizontal {{
-            background: {t["line"]};
-            min-width: 28px;
-            border-radius: 4px;
-            margin: 2px 0;
-        }}
-        QScrollBar::handle:horizontal:hover {{
-            background: {t["line_hover"]};
-        }}
-        QScrollBar::add-line, QScrollBar::sub-line,
-        QScrollBar::add-page, QScrollBar::sub-page {{
-            background: transparent;
-            border: none;
-            width: 0;
-            height: 0;
-        }}
-
-        QSplitter::handle {{
-            background-color: transparent;
-            width: 8px;
-        }}
-        QSplitter::handle:hover {{
-            background-color: {t["line"]};
-        }}
-
-        QWidget#projectSidebar, QWidget#editorPanel {{
-            background-color: {t["panel"]};
-            border: 1px solid {t["line"]};
-            border-radius: 12px;
-        }}
-        QWidget#projectSidebar QLabel, QWidget#editorPanel QLabel {{
-            background: transparent;
-        }}
-        QWidget#editorPanel QWidget {{
-            background-color: transparent;
-        }}
-        QWidget#editorPanel QLineEdit, QWidget#editorPanel QComboBox,
-        QWidget#editorPanel QSpinBox, QWidget#editorPanel QDoubleSpinBox,
-        QWidget#editorPanel QPlainTextEdit {{
-            background-color: {t["field"]};
-        }}
-        QWidget#editorPanel QPushButton {{
-            background-color: {t["raised"]};
-        }}
-        QWidget#editorPanel QPushButton[primary="true"] {{
-            background-color: {t["accent"]};
-        }}
-        QWidget#editorPanel QPushButton:checked {{
-            background-color: {t["accent_dim"]};
-        }}
-
-        QFrame#itemCard {{
-            background-color: {t["raised"]};
-            border: 1px solid {t["line"]};
-            border-radius: 12px;
-        }}
-        QFrame#itemCard QLabel {{
-            background: transparent;
-        }}
-        QLabel#cardName {{
-            font-size: 12pt;
-            font-weight: 700;
-        }}
-        QLabel#cardMeta {{
-            color: {t["muted"]};
-        }}
-        QLabel#cardSprite {{
-            background-color: {t["bg"]};
-            border: 1px solid {t["line"]};
-            border-radius: 9px;
-        }}
-        QFrame#cardDivider {{
-            background-color: {t["line"]};
-            border: none;
-        }}
-
-        QStatusBar {{
-            background-color: {t["bg"]};
-            color: {t["muted"]};
-        }}
-        QToolTip {{
-            background-color: {t["raised"]};
-            color: {t["text"]};
-            border: 1px solid {t["line_hover"]};
-            padding: 5px 8px;
-            border-radius: 5px;
-        }}
-    """
-
-
-class ItemCard(QFrame):
-    """Карточка предмета в духе подсказки из игры."""
-
-    def __init__(self):
-        super().__init__()
-        self.setObjectName("itemCard")
-        self.setFixedWidth(310)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(10)
-
-        top = QHBoxLayout()
-        top.setSpacing(14)
-
-        self.sprite_label = QLabel()
-        self.sprite_label.setObjectName("cardSprite")
-        self.sprite_label.setFixedSize(64, 64)
-        self.sprite_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        top.addWidget(self.sprite_label)
-
-        titles = QVBoxLayout()
-        titles.setSpacing(2)
-
-        self.name_label = QLabel()
-        self.name_label.setObjectName("cardName")
-        self.name_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.name_label.setWordWrap(True)
-
-        self.meta_label = QLabel()
-        self.meta_label.setObjectName("cardMeta")
-        self.meta_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.meta_label.setWordWrap(True)
-
-        titles.addStretch()
-        titles.addWidget(self.name_label)
-        titles.addWidget(self.meta_label)
-        titles.addStretch()
-        top.addLayout(titles, 1)
-
-        layout.addLayout(top)
-
-        self.divider = QFrame()
-        self.divider.setObjectName("cardDivider")
-        self.divider.setFixedHeight(1)
-        layout.addWidget(self.divider)
-
-        self.stats_label = QLabel()
-        self.stats_label.setTextFormat(Qt.TextFormat.RichText)
-        self.stats_label.setWordWrap(True)
-        layout.addWidget(self.stats_label)
-
-        self.description_label = QLabel()
-        self.description_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.description_label.setWordWrap(True)
-        layout.addWidget(self.description_label)
-
-        self.price_label = QLabel()
-        self.price_label.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(self.price_label)
-
-        layout.addStretch()
-
-    @staticmethod
-    def speed_name(use_time):
-        for limit, name in (
-            (8, "Безумно быстрая"),
-            (20, "Очень быстрая"),
-            (25, "Быстрая"),
-            (30, "Средняя"),
-            (35, "Медленная"),
-            (45, "Очень медленная"),
-            (55, "Крайне медленная"),
-        ):
-            if use_time <= limit:
-                return name
-
-        return "Улиточная"
-
-    def update_card(
-        self, name, rarity, category, description, sprite,
-        damage, damage_type, crit, use_time, mana, knockback, price
-    ):
-        color = RARITY_COLORS.get(rarity, THEME["text"])
-
-        if name.strip():
-            self.name_label.setText(name.strip())
-            self.name_label.setStyleSheet(f"color:{color};")
-        else:
-            self.name_label.setText("Без названия")
-            self.name_label.setStyleSheet(f"color:{THEME['muted']};")
-
-        self.meta_label.setText(f"{rarity} · {category}")
-
-        if isinstance(sprite, QImage) and not sprite.isNull():
-            self.sprite_label.setPixmap(
-                QPixmap.fromImage(sprite).scaled(
-                    52, 52,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.FastTransformation
-                )
-            )
-        else:
-            self.sprite_label.clear()
-
-        lines = []
-
-        if damage > 0:
-            kind = DAMAGE_TYPE_NAMES.get(damage_type, "")
-            lines.append(
-                f"<b>{damage}</b> ед. урона {kind}".rstrip()
-            )
-            lines.append(f"<b>{crit}%</b> шанс критического удара")
-            lines.append(f"{self.speed_name(use_time)} скорость")
-
-            if knockback > 0:
-                lines.append(f"Отбрасывание: <b>{knockback:g}</b>")
-
-            if mana > 0:
-                lines.append(f"Расходует <b>{mana}</b> маны")
-
-        self.stats_label.setVisible(bool(lines))
-        self.stats_label.setText("<br>".join(lines))
-
-        has_description = bool(description.strip())
-        self.description_label.setVisible(has_description)
-        self.description_label.setText(description.strip())
-        self.description_label.setStyleSheet(
-            f"color:{THEME['muted']};"
+    for state, _label in BOSS_ANIMATION_STATES:
+        animation = _as_dict(_as_dict(animations).get(state))
+        total += sum(
+            1 for frame in _as_list(animation.get("frames"))
+            if isinstance(frame, dict)
         )
 
-        coins = []
+    return total
 
-        for amount, label, coin_color in (
-            (price // 1_000_000, "плат.", "#a8d8e8"),
-            (price // 10_000 % 100, "зол.", THEME["accent"]),
-            (price // 100 % 100, "сер.", "#c3cbd6"),
-            (price % 100, "мед.", "#d08a52"),
-        ):
-            if amount:
-                coins.append(
-                    f'<span style="color:{coin_color}">'
-                    f"{amount} {label}</span>"
-                )
 
-        self.price_label.setText(
-            " ".join(coins) if coins
-            else f'<span style="color:{THEME["muted"]}">Без стоимости</span>'
-        )
+def boss_is_animated(animations):
+    """Совпадает с правилом генератора: лист кадров нужен от двух кадров."""
 
+    return boss_frame_count(animations) >= 2
 
-CSHARP_KEYWORDS = frozenset("""
-abstract as base bool break byte case catch char checked class const continue
-decimal default delegate do double else enum event explicit extern false finally
-fixed float for foreach goto if implicit in int interface internal is lock long
-namespace new null object operator out override params private protected public
-readonly ref return sbyte sealed short sizeof stackalloc static string struct
-switch this throw true try typeof uint ulong unchecked unsafe ushort using
-virtual void volatile while
-""".split())
 
+def boss_generated_members(data):
+    """Члены класса, которые TMC пишет сам для этого босса."""
 
-class PixelCanvas(QGraphicsView):
-    def __init__(self, grid=32, scale=12):
-        super().__init__()
+    members = []
+    defense = _as_dict(_as_dict(data).get("defense"))
+    contact = _as_dict(defense.get("contact_buff"))
 
-        self.grid = grid
-        self.scale = scale
-        self.eraser = False
-        self.fill_tool = False
-        
-        self.image = QImage(
-            grid, grid, QImage.Format_ARGB32
-        )
-        self.image.fill(Qt.GlobalColor.transparent)
+    if contact.get("enabled", False):
+        members.append("OnHitPlayer")
 
-        self.color = QColor("#f2f2f2")
+    if _as_list(_as_dict(data).get("loot")):
+        members.append("OnKill")
 
-        # История изменений
-        self.undo_history = []
-        self.redo_history = []
-        self.history_limit = 50
-        self.stroke_recorded = False
+    return tuple(members)
 
-        # Графическая сцена
-        self.scene_obj = QGraphicsScene(self)
-        self.setScene(self.scene_obj)
 
-        self.pixmap_item = QGraphicsPixmapItem()
-        self.scene_obj.addItem(self.pixmap_item)
+def boss_custom_projectile_id(boss_id):
+    """Имя класса собственного снаряда босса."""
 
-        self.setMinimumSize(460, 460)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    return f"{boss_id}_orb"
 
-        self.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        )
-        self.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        )
 
-        self.setBackgroundBrush(QColor("#10131a"))
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+def boss_custom_projectile_enabled(data):
+    shoot = _as_dict(_as_dict(_as_dict(data).get("actions")).get("shoot"))
 
-        self.setStyleSheet("""
-            QGraphicsView {
-                background-color: #10131a;
-                border: 1px solid #2c333e;
-                border-radius: 10px;
-            }
-        """)
+    return bool(shoot.get("enabled")) and str(
+        shoot.get("source", "vanilla")
+    ) == "custom"
 
-        self.refresh()
 
-    # --------------------------------------------------------
-    # DISPLAY
-    # --------------------------------------------------------
+def empty_boss_animations():
+    """Пустые ленты кадров для всех состояний босса."""
 
-    
-    def drawBackground(self, painter, rect):
-        """Шахматный фон рисуется только внутри настоящего холста."""
+    return {
+        state: {
+            "frames": [],
+            "loop": state != "attack",
+        }
+        for state, _label in BOSS_ANIMATION_STATES
+    }
 
-        cell = self.scale
 
-        # Физические границы изображения в координатах сцены
-        canvas_width = self.image.width() * cell
-        canvas_height = self.image.height() * cell
+def normalize_boss_animations(data):
+    """Достаёт анимации из нового и старого формата данных босса."""
 
-        # Ограничиваем область рисования настоящим холстом
-        painter.save()
-        painter.setClipRect(
-            0, 0,
-            canvas_width,
-            canvas_height
-        )
+    data = _as_dict(data)
+    source = data.get("animations")
 
-        color_a = QColor("#2a303a")
-        color_b = QColor("#20252d")
+    if not isinstance(source, dict):
+        source = {}
 
-        left = max(0, int(rect.left() // cell))
-        top = max(0, int(rect.top() // cell))
+    result = {}
 
-        right = min(
-            self.image.width(),
-            int(rect.right() // cell) + 1
-        )
+    for state, _label in BOSS_ANIMATION_STATES:
+        animation = source.get(state)
 
-        bottom = min(
-            self.image.height(),
-            int(rect.bottom() // cell) + 1
-        )
+        if not isinstance(animation, dict):
+            animation = {}
 
-        for y in range(top, bottom):
-            for x in range(left, right):
-                color = (
-                    color_a if (x + y) % 2 == 0
-                    else color_b
-                )
+        frames = animation.get("frames")
 
-                painter.fillRect(
-                    x * cell,
-                    y * cell,
-                    cell,
-                    cell,
-                    color
-                )
+        if not isinstance(frames, list):
+            frames = []
 
-        painter.restore()
-
-
-    def refresh(self):
-        """Обновляет отображение, не меняя оригинальный PNG."""
-
-        display = QPixmap.fromImage(self.image).scaled(
-            self.image.width() * self.scale,
-            self.image.height() * self.scale,
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.FastTransformation
-        )
-
-        self.pixmap_item.setPixmap(display)
-
-        self.scene_obj.setSceneRect(
-            0,
-            0,
-            display.width(),
-            display.height()
-        )
-
-        self.viewport().update()
-
-    def set_zoom(self, value):
-        self.scale = max(2, min(32, value))
-        self.refresh()
-
-    # --------------------------------------------------------
-    # IMAGE
-    # --------------------------------------------------------
-
-    def set_image(self, image):
-        """Загружает изображение без изменения разрешения."""
-
-        if image.isNull():
-            return
-
-        self.image = image.convertToFormat(
-            QImage.Format_ARGB32
-        ).copy()
-
-        self.undo_history.clear()
-        self.redo_history.clear()
-
-        self.grid = self.image.width()
-
-        self.refresh()
-
-    def get_image(self):
-        return self.image.copy()
-
-    def new_canvas(self, width, height):
-        """Создаёт полностью новый прозрачный холст."""
-
-        width = max(1, min(512, width))
-        height = max(1, min(512, height))
-
-        self.push_undo()
-
-        self.image = QImage(
-            width,
-            height,
-            QImage.Format_ARGB32
-        )
-
-        self.image.fill(Qt.GlobalColor.transparent)
-
-        self.grid = width
-        self.refresh()
-
-    def resize_canvas(self, width, height):
-        """
-        Изменяет границы холста.
-        Существующие пиксели сохраняют размер и положение.
-        """
-
-        width = max(1, min(512, width))
-        height = max(1, min(512, height))
-
-        if (
-            width == self.image.width()
-            and height == self.image.height()
-        ):
-            return
-
-        self.push_undo()
-
-        resized = QImage(
-            width,
-            height,
-            QImage.Format_ARGB32
-        )
-
-        resized.fill(Qt.GlobalColor.transparent)
-
-        painter = QPainter(resized)
-        painter.drawImage(0, 0, self.image)
-        painter.end()
-
-        self.image = resized
-        self.grid = width
-
-        self.refresh()
-
-    # --------------------------------------------------------
-    # HISTORY
-    # --------------------------------------------------------
-
-    def push_undo(self):
-        self.undo_history.append(self.image.copy())
-
-        if len(self.undo_history) > self.history_limit:
-            self.undo_history.pop(0)
-
-        self.redo_history.clear()
-
-    def undo(self):
-        if not self.undo_history:
-            return
-
-        self.redo_history.append(self.image.copy())
-
-        self.image = self.undo_history.pop()
-        self.grid = self.image.width()
-
-        self.refresh()
-
-    def redo(self):
-        if not self.redo_history:
-            return
-
-        self.undo_history.append(self.image.copy())
-
-        self.image = self.redo_history.pop()
-        self.grid = self.image.width()
-
-        self.refresh()
-
-    # --------------------------------------------------------
-    # TOOLS
-    # --------------------------------------------------------
-
-    def choose_color(self):
-        chosen = QColorDialog.getColor(
-            self.color,
-            self,
-            "Цвет пикселя"
-        )
-
-        if chosen.isValid():
-            self.color = chosen
-            self.eraser = False
-
-    def set_eraser(self, enabled):
-        self.eraser = enabled
-
-    def clear(self):
-        if self.image.isNull():
-            return
-
-        self.push_undo()
-
-        self.image.fill(Qt.GlobalColor.transparent)
-        self.refresh()
-
-    def paint_pixel(self, x, y):
-        if not (
-            0 <= x < self.image.width()
-            and 0 <= y < self.image.height()
-        ):
-            return
-
-        if self.eraser:
-            if self.image.pixelColor(x, y).alpha() == 0:
-                return
-
-            painter = QPainter(self.image)
-            painter.setCompositionMode(
-                QPainter.CompositionMode.CompositionMode_Clear
-            )
-            painter.fillRect(x, y, 1, 1, Qt.GlobalColor.transparent)
-            painter.end()
-
-        else:
-            if self.image.pixelColor(x, y) == self.color:
-                return
-
-            painter = QPainter(self.image)
-            painter.fillRect(x, y, 1, 1, self.color)
-            painter.end()
-
-        self.refresh()
-    
-    def fill_area(self, start_x, start_y):
-        """Заливает связную область одинаковых пикселей."""
-
-        width = self.image.width()
-        height = self.image.height()
-
-        target_color = self.image.pixelColor(
-            start_x, start_y
-        )
-
-        # Нет смысла заливать уже существующий цвет
-        if (
-            target_color == self.color
-            or (
-                target_color.alpha() == 0
-                and self.color.alpha() == 0
-            )
-        ):
-            return
-
-        self.push_undo()
-
-        stack = [(start_x, start_y)]
-        visited = bytearray(width * height)
-
-        target_is_transparent = target_color.alpha() == 0
-
-        while stack:
-            x, y = stack.pop()
-
-            index = y * width + x
-
-            if visited[index]:
-                continue
-
-            visited[index] = 1
-
-            current_color = self.image.pixelColor(x, y)
-
-            # Все прозрачные пиксели считаем одной областью
-            if target_is_transparent:
-                matches = current_color.alpha() == 0
-            else:
-                matches = current_color == target_color
-
-            if not matches:
-                continue
-
-            self.image.setPixelColor(
-                x, y, self.color
-            )
-
-            # Проверяем соседние пиксели
-            if x > 0:
-                stack.append((x - 1, y))
-
-            if x < width - 1:
-                stack.append((x + 1, y))
-
-            if y > 0:
-                stack.append((x, y - 1))
-
-            if y < height - 1:
-                stack.append((x, y + 1))
-
-        self.refresh()
-
-
-    def set_fill_tool(self, enabled):
-        self.fill_tool = enabled
-
-        if enabled:
-            self.eraser = False
-
-
-
-    def get_pixel_coordinates(self, position):
-        """Получает координаты пикселя относительно холста."""
-
-        scene_pos = self.mapToScene(position)
-
-        x = int(scene_pos.x() // self.scale)
-        y = int(scene_pos.y() // self.scale)
-
-        if (
-            0 <= x < self.image.width()
-            and 0 <= y < self.image.height()
-        ):
-            return x, y
-
-        return None
-
-
-    def draw_at_position(self, position):
-        coordinates = self.get_pixel_coordinates(position)
-
-        if coordinates is None:
-            return False
-
-        x, y = coordinates
-        self.paint_pixel(x, y)
-
-        return True
-
-
-    # --------------------------------------------------------
-    # MOUSE
-    # --------------------------------------------------------
-
-    
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-
-            coordinates = self.get_pixel_coordinates(
-                event.position().toPoint()
-            )
-
-            if coordinates is None:
-                return
-
-            self.setFocus()
-
-            x, y = coordinates
-
-            # Режим заливки
-            if self.fill_tool:
-                self.fill_area(x, y)
-                event.accept()
-                return
-
-            # Обычное рисование
-            self.push_undo()
-            self.stroke_recorded = True
-
-            self.paint_pixel(x, y)
-            
-
-            event.accept()
-            return
-
-        super().mousePressEvent(event)
-
-
-    def mouseMoveEvent(self, event):
-        if (
-            event.buttons() & Qt.MouseButton.LeftButton
-            and self.stroke_recorded
-        ):
-            self.draw_at_position(
-                event.position().toPoint()
-            )
-
-            event.accept()
-            return
-
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.stroke_recorded = False
-            event.accept()
-            return
-
-        super().mouseReleaseEvent(event)
-
-    # --------------------------------------------------------
-    # PNG
-    # --------------------------------------------------------
-
-    def import_png(self, path):
-        source = QImage(path)
-
-        if source.isNull():
-            raise ValueError("Не удалось открыть PNG.")
-
-        self.set_image(source)
-
-    def export_png(self, path):
-        if not self.image.save(path, "PNG"):
-            raise OSError("Не удалось сохранить PNG.")
-
-
-
-
-class InventoryPreview(QWidget):
-    def __init__(self):
-        super().__init__()
-
-        self.setMinimumSize(330, 250)
-
-        base = Path(__file__).resolve().parent
-        coin_dir = base / "images"
-
-        self.slot_image = QPixmap(
-            str(coin_dir / "Inventory_Back24.png")
-        )
-
-        self.heart_image = QPixmap(
-            str(coin_dir / "Heart.png")
-        )
-
-        self.item_image = QImage()
-
-    def set_item_image(self, image):
-        self.item_image = image.copy()
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-
-        painter.setRenderHint(
-            QPainter.RenderHint.SmoothPixmapTransform,
-            False
-        )
-
-        # Сердца
-        heart_size = 24
-
-        if not self.heart_image.isNull():
-            for i in range(5):
-                x = 15 + i * 30
-                painter.drawPixmap(
-                    x, 15,
-                    heart_size, heart_size,
-                    self.heart_image
-                )
-
-        # Ячейки инвентаря
-        slot_size = 48
-        start_x = 15
-        start_y = 65
-
-        for row in range(3):
-            for col in range(5):
-                x = start_x + col * 52
-                y = start_y + row * 52
-
-                if not self.slot_image.isNull():
-                    painter.drawPixmap(
-                        x, y,
-                        slot_size, slot_size,
-                        self.slot_image
-                    )
-
-        # Текущий предмет в первой ячейке
-        if not self.item_image.isNull():
-            pixmap = QPixmap.fromImage(
-                self.item_image
-            ).scaled(
-                32, 32,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation
-            )
-
-            painter.drawPixmap(
-                start_x + 8,
-                start_y + 8,
-                pixmap
-            )
-
-        painter.end()
-
-
-class ResourceManager(QWidget):
-    image_selected = Signal(str)
-    def __init__(self):
-        super().__init__()
-
-        self.base_dir = Path(
-            getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
-        )
-        self.project_path = None
-        self.icon_cache = {}
-
-        self.build_ui()
-        self.refresh()
-
-    def build_ui(self):
-        root = QVBoxLayout(self)
-
-        # Верхняя панель
-        toolbar = QHBoxLayout()
-
-        self.filter_box = QComboBox()
-        self.filter_box.addItems([
-            "Все ресурсы",
-            "Изображения",
-            "Звуки"
-        ])
-        self.filter_box.currentIndexChanged.connect(
-            self.refresh
-        )
-
-        import_btn = QPushButton("Импортировать")
-        import_btn.clicked.connect(self.import_resources)
-
-        assign_btn = QPushButton("Назначить изображение")
-        assign_btn.clicked.connect(
-            self.assign_selected_image
-        )
-
-        refresh_btn = QPushButton("Обновить")
-        refresh_btn.clicked.connect(self.refresh)
-
-        delete_btn = QPushButton("Удалить ресурс")
-        delete_btn.clicked.connect(self.delete_resource)
-
-        toolbar.addWidget(QLabel("Фильтр:"))
-        toolbar.addWidget(self.filter_box)
-        toolbar.addStretch()
-        toolbar.addWidget(import_btn)
-        toolbar.addWidget(refresh_btn)
-        toolbar.addWidget(delete_btn)
-        toolbar.addWidget(assign_btn)
-        root.addLayout(toolbar)
-
-        # Основная область
-        content = QSplitter()
-
-        self.resource_list = QListWidget()
-        self.resource_list.setIconSize(
-            QSize(64, 64)
-        )
-        self.resource_list.currentItemChanged.connect(
-            self.show_resource
-        )
-
-        content.addWidget(self.resource_list)
-
-        # Информация о выбранном файле
-        preview = QWidget()
-        preview_layout = QVBoxLayout(preview)
-
-        self.preview_image = QLabel()
-        self.preview_image.setFixedSize(220, 220)
-        self.preview_image.setAlignment(
-            Qt.AlignmentFlag.AlignCenter
-        )
-        self.preview_image.setStyleSheet("""
-            background:#171a1e;
-            border:1px solid #2c333e;
-            border-radius:8px;
-        """)
-
-        self.resource_name = QLabel("Ресурс не выбран")
-        self.resource_name.setWordWrap(True)
-
-        self.resource_path = QLabel("")
-        self.resource_path.setWordWrap(True)
-        self.resource_path.setStyleSheet(
-            "color:#9eabb9;padding:4px 8px;"
-        )
-
-        self.resource_info = QLabel("")
-        self.resource_info.setWordWrap(True)
-
-        preview_layout.addWidget(self.preview_image)
-        preview_layout.addWidget(self.resource_name)
-        preview_layout.addWidget(self.resource_path)
-        preview_layout.addWidget(self.resource_info)
-        preview_layout.addStretch()
-
-        content.addWidget(preview)
-        content.setSizes([650, 300])
-
-        root.addWidget(content, 1)
-
-        self.status_label = QLabel("")
-        self.status_label.setStyleSheet(
-            "color:#aeb8c5;"
-        )
-        root.addWidget(self.status_label)
-
-    # --------------------------------------------------------
-    # PROJECT
-    # --------------------------------------------------------
-
-    def set_project(self, path):
-        self.project_path = (
-            Path(path) if path else None
-        )
-        self.refresh()
-
-    # --------------------------------------------------------
-    # RESOURCE DISCOVERY
-    # --------------------------------------------------------
-
-    def refresh(self):
-        self.resource_list.clear()
-
-        filter_index = self.filter_box.currentIndex()
-
-        image_extensions = {
-            ".png", ".jpg", ".jpeg",
-            ".webp", ".bmp", ".gif"
+        result[state] = {
+            "frames": list(frames),
+            "loop": bool(animation.get("loop", state != "attack")),
         }
 
-        sound_extensions = {
-            ".wav", ".ogg", ".mp3"
-        }
-
-        resources = []
-
-        # Встроенные ресурсы TMC
-        builtin_dir = self.base_dir / "images"
-
-        if builtin_dir.exists():
-            for path in builtin_dir.rglob("*"):
-                if path.is_file():
-                    resources.append(
-                        (path, "TMC")
-                    )
-
-        # Ресурсы открытого проекта
-        if self.project_path:
-            assets_dir = self.project_path / "Assets" / "Resources"
-
-            if assets_dir.exists():
-                for path in assets_dir.rglob("*"):
-                    if path.is_file():
-                        resources.append(
-                            (path, "Проект")
-                        )
-
-        shown = 0
-
-        for path, source in resources:
-            extension = path.suffix.lower()
-
-            if extension in image_extensions:
-                resource_type = "Изображение"
-            elif extension in sound_extensions:
-                resource_type = "Звук"
-            else:
-                continue
-
-            if filter_index == 1 and resource_type != "Изображение":
-                continue
-
-            if filter_index == 2 and resource_type != "Звук":
-                continue
-
-            if resource_type == "Изображение":
-                cache_key = (str(path), path.stat().st_mtime_ns)
-                icon = self.icon_cache.get(cache_key)
-
-                if icon is None:
-                    pixmap = QPixmap(str(path))
-
-                    if pixmap.isNull():
-                        continue
-
-                    icon = QIcon(
-                        pixmap.scaled(
-                            64, 64,
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.FastTransformation
-                        )
-                    )
-                    self.icon_cache[cache_key] = icon
-            else:
-                icon = QIcon()
-
-            if source == "TMC":
-                relative_path = path.relative_to(
-                    self.base_dir
-                )
-            else:
-                relative_path = path.relative_to(
-                    self.project_path
-                )
-
-            item = QListWidgetItem(
-                icon,
-                path.name
-            )
-
-            item.setData(
-                Qt.ItemDataRole.UserRole,
-                str(path)
-            )
-
-            item.setData(
-                Qt.ItemDataRole.UserRole + 1,
-                source
-            )
-
-            item.setToolTip(str(relative_path))
-
-            self.resource_list.addItem(item)
-            shown += 1
-
-        self.status_label.setText(
-            f"Найдено ресурсов: {shown}"
-        )
-
-        self.preview_image.clear()
-        self.resource_name.setText("Ресурс не выбран")
-        self.resource_path.clear()
-        self.resource_info.clear()
-
-    # --------------------------------------------------------
-    # RESOURCE PREVIEW
-    # --------------------------------------------------------
-
-    def show_resource(self, current, previous=None):
-        if current is None:
-            return
-
-        path = Path(
-            current.data(Qt.ItemDataRole.UserRole)
-        )
-
-        source = current.data(
-            Qt.ItemDataRole.UserRole + 1
-        )
-
-        self.resource_name.setText(path.name)
-
-        if source == "TMC":
-            relative = path.relative_to(self.base_dir)
-        else:
-            relative = path.relative_to(self.project_path)
-
-        self.resource_path.setText(
-            f"Источник: {source}\nПуть: {relative}"
-        )
-
-        extension = path.suffix.lower()
-
-        if extension in {
-            ".png", ".jpg", ".jpeg",
-            ".webp", ".bmp", ".gif"
-        }:
-            pixmap = QPixmap(str(path))
-
-            self.preview_image.setPixmap(
-                pixmap.scaled(
-                    200, 200,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.FastTransformation
-                )
-            )
-
-            self.resource_info.setText(
-                f"Тип: Изображение\n"
-                f"Размер: {pixmap.width()} × {pixmap.height()}\n"
-                f"Формат: {extension.upper()}"
-            )
-
-        else:
-            self.preview_image.clear()
-
-            size = path.stat().st_size
-
-            self.resource_info.setText(
-                f"Тип: Звуковой файл\n"
-                f"Формат: {extension.upper()}\n"
-                f"Размер: {size:,} байт"
-            )
-
-    # --------------------------------------------------------
-    # IMPORT
-    # --------------------------------------------------------
-
-    def import_resources(self):
-        if self.project_path is None:
-            QMessageBox.warning(
-                self,
-                "Нет проекта",
-                "Сначала создай или открой проект."
-            )
-            return
-
-        files, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Импорт ресурсов",
-            "",
-            "Поддерживаемые файлы (*.png *.jpg *.jpeg "
-            "*.webp *.bmp *.gif *.wav *.ogg *.mp3)"
-        )
-
-        if not files:
-            return
-
-        image_extensions = {
-            ".png", ".jpg", ".jpeg",
-            ".webp", ".bmp", ".gif"
-        }
-
-        sound_extensions = {
-            ".wav", ".ogg", ".mp3"
-        }
-
-        imported = 0
-
-        for file in files:
-            source = Path(file)
-            extension = source.suffix.lower()
-
-            if extension in image_extensions:
-                folder = "Images"
-            elif extension in sound_extensions:
-                folder = "Sounds"
-            else:
-                continue
-
-            destination_dir = (
-                self.project_path
-                / "Assets"
-                / "Resources"
-                / folder
-            )
-
-            destination_dir.mkdir(
-                parents=True,
-                exist_ok=True
-            )
-
-            destination = destination_dir / source.name
-
-            # Не перезаписываем существующий файл
-            number = 1
-
-            while destination.exists():
-                destination = (
-                    destination_dir
-                    / f"{source.stem}_{number}{extension}"
-                )
-                number += 1
-
-            shutil.copy2(source, destination)
-            imported += 1
-
-        self.refresh()
-
-        self.status_label.setText(
-            f"Импортировано файлов: {imported}"
-        )
-
-    # --------------------------------------------------------
-    # DELETE
-    # --------------------------------------------------------
-
-    def delete_resource(self):
-        item = self.resource_list.currentItem()
-
-        if item is None:
-            return
-
-        path = Path(
-            item.data(Qt.ItemDataRole.UserRole)
-        )
-
-        source = item.data(
-            Qt.ItemDataRole.UserRole + 1
-        )
-
-        if source != "Проект" or self.project_path is None:
-            QMessageBox.warning(
-                self,
-                "Удаление недоступно",
-                "Встроенные ресурсы TMC нельзя удалять."
-            )
-            return
-
-        resources_dir = (
-            self.project_path
-            / "Assets"
-            / "Resources"
-        ).resolve()
-
-        try:
-            path.resolve().relative_to(resources_dir)
-        except ValueError:
-            QMessageBox.warning(
-                self,
-                "Удаление недоступно",
-                "Этот файл не находится в папке "
-                "Assets/Resources."
-            )
-            return
-
-        answer = QMessageBox.question(
-            self,
-            "Удаление ресурса",
-            f"Удалить файл {path.name}?",
-            QMessageBox.StandardButton.Yes |
-            QMessageBox.StandardButton.No
-        )
-
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-
-        try:
-            path.unlink()
-            self.refresh()
-
-            self.status_label.setText(
-                f"Удалён ресурс: {path.name}"
-            )
-
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Ошибка удаления",
-                str(exc)
-            )
-    def assign_selected_image(self):
-        item = self.resource_list.currentItem()
-
-        if item is None:
-            QMessageBox.warning(
-                self,
-                "Ресурс не выбран",
-                "Сначала выбери изображение."
-            )
-            return
-
-        path = Path(
-            item.data(Qt.ItemDataRole.UserRole)
-        )
-
-        extension = path.suffix.lower()
-
-        if extension not in {
-            ".png", ".jpg", ".jpeg",
-            ".webp", ".bmp", ".gif"
-        }:
-            QMessageBox.warning(
-                self,
-                "Неподходящий ресурс",
-                "Предмету можно назначить только изображение."
-            )
-            return
-
-        if self.project_path is None:
-            QMessageBox.warning(
-                self,
-                "Нет проекта",
-                "Сначала создай или открой проект."
-            )
-            return
-
-        source = item.data(
-            Qt.ItemDataRole.UserRole + 1
-        )
-
-        # Встроенный ресурс копируем в проект
-        if source == "TMC":
-
-            destination_dir = (
-                self.project_path
-                / "Assets"
-                / "Resources"
-                / "Images"
-            )
-
-            destination_dir.mkdir(
-                parents=True,
-                exist_ok=True
-            )
-
-            destination = destination_dir / path.name
-
-            number = 1
-
-            while destination.exists():
-                destination = (
-                    destination_dir
-                    / f"{path.stem}_{number}{path.suffix}"
-                )
-                number += 1
-
-            shutil.copy2(path, destination)
-            path = destination
-
-        relative_path = path.relative_to(
-            self.project_path
-        )
-
-        self.image_selected.emit(
-            relative_path.as_posix()
-        )
-
-
-class AnimationEditor(QWidget):
-    add_frame_requested = Signal()
-
-    def __init__(self):
-        super().__init__()
-
-        self.frames = []
-        self.current_index = -1
-        self.loop = True
-
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.next_frame)
-
-        self.build_ui()
-
-    def build_ui(self):
-        root = QHBoxLayout(self)
-
-        # Левая часть — список кадров
-        left = QVBoxLayout()
-        left.addWidget(section_label("Кадры анимации"))
-
-        self.frame_list = QListWidget()
-        self.frame_list.setIconSize(QSize(64, 64))
-        self.frame_list.currentRowChanged.connect(
-            self.select_frame
-        )
-
-        left.addWidget(self.frame_list, 1)
-
-        add_btn = QPushButton("+ Добавить текущий спрайт")
-        add_btn.clicked.connect(
-            self.add_frame_requested.emit
-        )
-
-        duplicate_btn = QPushButton("Дублировать кадр")
-        duplicate_btn.clicked.connect(self.duplicate_frame)
-
-        delete_btn = QPushButton("Удалить кадр")
-        delete_btn.clicked.connect(self.delete_frame)
-
-        up_btn = QPushButton("↑ Переместить выше")
-        up_btn.clicked.connect(lambda: self.move_frame(-1))
-
-        down_btn = QPushButton("↓ Переместить ниже")
-        down_btn.clicked.connect(lambda: self.move_frame(1))
-
-        import_btn = QPushButton("Импорт последовательности PNG")
-        import_btn.clicked.connect(self.import_frames)
-
-        left.addWidget(add_btn)
-        left.addWidget(duplicate_btn)
-        left.addWidget(delete_btn)
-        left.addWidget(up_btn)
-        left.addWidget(down_btn)
-        left.addWidget(import_btn)
-
-        root.addLayout(left, 1)
-
-        # Правая часть — предпросмотр
-        right = QVBoxLayout()
-
-        right.addWidget(section_label("Предпросмотр"))
-
-        self.preview = QLabel("Нет кадров")
-        self.preview.setFixedSize(300, 300)
-        self.preview.setAlignment(
-            Qt.AlignmentFlag.AlignCenter
-        )
-        self.preview.setStyleSheet("""
-            background:#171a1e;
-            border:1px solid #2c333e;
-            border-radius:8px;
-        """)
-
-        right.addWidget(
-            self.preview,
-            alignment=Qt.AlignmentFlag.AlignCenter
-        )
-
-        right.addWidget(QLabel("Длительность текущего кадра"))
-
-        self.duration = QSpinBox()
-        self.duration.setRange(20, 10000)
-        self.duration.setValue(100)
-        self.duration.setSuffix(" мс")
-        self.duration.valueChanged.connect(
-            self.update_duration
-        )
-
-        right.addWidget(self.duration)
-
-        self.loop_checkbox = QCheckBox("Зацикливать анимацию")
-        self.loop_checkbox.setChecked(True)
-        self.loop_checkbox.toggled.connect(
-            self.set_loop
-        )
-
-        right.addWidget(self.loop_checkbox)
-
-        playback = QHBoxLayout()
-
-        play_btn = QPushButton("▶ Воспроизвести")
-        play_btn.clicked.connect(self.play)
-
-        stop_btn = QPushButton("■ Остановить")
-        stop_btn.clicked.connect(self.stop)
-
-        playback.addWidget(play_btn)
-        playback.addWidget(stop_btn)
-
-        right.addLayout(playback)
-        right.addStretch()
-
-        root.addLayout(right, 2)
-
-    # --------------------------------------------------------
-    # FRAMES
-    # --------------------------------------------------------
-
-    def get_animation(self):
-        return {
-            "frames": [
-                {
-                    "image": frame["image"].copy(),
-                    "duration_ms": frame["duration_ms"]
+    # В проектах до появления состояний была одна анимация.
+    # Считаем её анимацией движения, чтобы ничего не потерять.
+    if not result["move"]["frames"]:
+        legacy = data.get("animation")
+
+        if isinstance(legacy, dict):
+            frames = legacy.get("frames")
+
+            if isinstance(frames, list) and frames:
+                result["move"] = {
+                    "frames": list(frames),
+                    "loop": bool(legacy.get("loop", True)),
                 }
-                for frame in self.frames
-            ],
-            "loop": self.loop
-        }
 
-    def set_animation(self, animation):
-        self.stop()
+    return result
 
-        animation = animation or {}
 
-        self.frames = [
-            {
-                "image": frame["image"].copy(),
-                "duration_ms": int(frame.get("duration_ms", 100))
-            }
-            for frame in animation.get("frames", [])
+# ============================================================
+# ПРОВЕРКА ПАРАМЕТРОВ
+# ============================================================
+
+
+def check_boss(boss_id, data, sprite, animations):
+    """Проверяет параметры босса и возвращает замечания."""
+
+    issues = []
+    prefix = str(boss_id or "босс")
+
+    def add(text):
+        issues.append(f"{prefix}: {text}")
+
+    data = _as_dict(data)
+    stats = _as_dict(data.get("stats"))
+    actions = _as_dict(data.get("actions"))
+    defense = _as_dict(data.get("defense"))
+
+    dash = _as_dict(actions.get("dash"))
+    shoot = _as_dict(actions.get("shoot"))
+    contact = _as_dict(defense.get("contact_buff"))
+
+    if not str(data.get("name", "")).strip():
+        add("нет названия — в игре будет показан внутренний ID.")
+
+    life = _clamped_int(stats.get("life_max"), 4000, 1, 10_000_000)
+    damage = _clamped_int(stats.get("damage"), 0, 0, 100_000)
+    defense_value = _clamped_int(stats.get("defense"), 0, 0, 10_000)
+    width = _clamped_int(stats.get("width"), 100, 8, 1024)
+    height = _clamped_int(stats.get("height"), 100, 8, 1024)
+    scale = _clamped_float(stats.get("scale"), 1.0, 0.1, 10.0)
+    speed = _clamped_float(stats.get("movement_speed"), 6.0, 0.1, 30.0)
+    ai = str(stats.get("ai", "hover"))
+
+    if life < 100:
+        add("меньше 100 здоровья: для босса это почти мгновенная смерть.")
+
+    if damage <= 0:
+        add("урон 0: босс не сможет нанести урон игроку.")
+
+    if defense_value > 1000:
+        add(f"защита {defense_value}: игрок почти не сможет пробить босса.")
+
+    if width < 16 or height < 16:
+        add("хитбокс меньше 16 px: босс будет почти неосязаемым.")
+
+    if max(width, height) > 1024:
+        add("хитбокс больше 1024 px: столкновения могут работать странно.")
+
+    if scale < 0.2 or scale > 5.0:
+        add(f"масштаб {scale:g}: разумный диапазон — от 0.2 до 5.")
+
+    if ai not in BOSS_AI_CODES:
+        add(f"неизвестное поведение «{ai}», будет использовано парение.")
+    elif ai == "hover" and speed > 20:
+        add(f"скорость {speed:g} для парения очень высокая.")
+    elif ai == "jump" and speed > 15:
+        add(f"скорость {speed:g} для прыжков очень высокая.")
+
+    if ai == "orbit":
+        radius = _clamped_int(stats.get("orbit_radius"), 260, 40, 1500)
+        angular = _clamped_float(stats.get("orbit_speed"), 1.5, 0.1, 12.0)
+
+        if radius < 80:
+            add(f"радиус орбиты {radius} px: босс будет висеть на игроке.")
+        if angular > 6:
+            add(f"скорость орбиты {angular:g}°/тик: игрока будет укачивать.")
+    elif ai == "teleport":
+        interval = _clamped_int(
+            stats.get("teleport_interval"), 240, 30, 36_000
+        )
+        teleport_range = _clamped_int(
+            stats.get("teleport_range"), 320, 60, 1200
+        )
+
+        if interval < 60:
+            add("телепорт чаще раза в секунду: бой станет хаотичным.")
+        if teleport_range > 900:
+            add(
+                f"разброс телепорта {teleport_range} px: босс может "
+                "оказаться далеко за экраном."
+            )
+    elif ai == "charge":
+        charge_speed = _clamped_float(
+            stats.get("charge_speed"), 16.0, 2.0, 40.0
+        )
+        pause = _clamped_int(stats.get("charge_pause"), 90, 10, 1200)
+
+        if charge_speed > 30:
+            add(f"скорость броска {charge_speed:g} очень высокая.")
+        if pause < 30:
+            add("пауза между бросками меньше 0.5 секунды: босс не даст передышки.")
+
+    expert = _clamped_int(stats.get("expert_life_percent"), 100, 50, 1000)
+    master = _clamped_int(stats.get("master_life_percent"), 100, 50, 1000)
+
+    if master < expert:
+        add("в мастере здоровья меньше, чем в эксперте — обычно наоборот.")
+
+    if master > 500:
+        add(f"в мастере {master}% здоровья: бой может затянуться на минуты.")
+
+    # --- анимации ---
+    state_has_frames = {}
+    images = []
+    sizes = set()
+
+    for state, label in BOSS_ANIMATION_STATES:
+        animation = animations.get(state) if isinstance(animations, dict) else None
+        animation = _as_dict(animation)
+        state_has_frames[state] = False
+
+        frames = [
+            frame
+            for frame in _as_list(animation.get("frames"))
+            if isinstance(frame, dict)
         ]
 
-        self.loop = animation.get("loop", True)
+        if not frames:
+            continue
 
-        self.loop_checkbox.blockSignals(True)
-        self.loop_checkbox.setChecked(self.loop)
-        self.loop_checkbox.blockSignals(False)
+        state_has_frames[state] = True
 
-        self.current_index = -1
-        self.refresh_list()
+        for index, frame in enumerate(frames, 1):
+            image = frame.get("image")
+            frame_label = f"{label.lower()}, кадр {index}"
 
-        if self.frames:
-            self.frame_list.setCurrentRow(0)
-        else:
-            self.preview.setText("Нет кадров")
-
-    def add_frame(self, image):
-        if image.isNull():
-            return
-
-        self.frames.append({
-            "image": image.copy(),
-            "duration_ms": 100
-        })
-
-        self.refresh_list()
-        self.frame_list.setCurrentRow(len(self.frames) - 1)
-
-    def duplicate_frame(self):
-        index = self.current_index
-
-        if not (0 <= index < len(self.frames)):
-            return
-
-        original = self.frames[index]
-
-        self.frames.insert(index + 1, {
-            "image": original["image"].copy(),
-            "duration_ms": original["duration_ms"]
-        })
-
-        self.refresh_list()
-        self.frame_list.setCurrentRow(index + 1)
-
-    def delete_frame(self):
-        index = self.current_index
-
-        if not (0 <= index < len(self.frames)):
-            return
-
-        self.frames.pop(index)
-
-        self.refresh_list()
-
-        if self.frames:
-            self.frame_list.setCurrentRow(
-                min(index, len(self.frames) - 1)
-            )
-        else:
-            self.current_index = -1
-            self.preview.setText("Нет кадров")
-
-    def move_frame(self, direction):
-        index = self.current_index
-        target = index + direction
-
-        if not (0 <= index < len(self.frames)):
-            return
-
-        if not (0 <= target < len(self.frames)):
-            return
-
-        self.frames[index], self.frames[target] = (
-            self.frames[target],
-            self.frames[index]
-        )
-
-        self.refresh_list()
-        self.frame_list.setCurrentRow(target)
-
-    def import_frames(self):
-        files, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Импорт кадров",
-            "",
-            "PNG (*.png)"
-        )
-
-        if not files:
-            return
-
-        imported = []
-
-        for file in sorted(files):
-            image = QImage(file)
-
-            if image.isNull():
+            if image is None or image.isNull():
+                add(f"{frame_label}: пустой или повреждённый кадр.")
                 continue
 
-            imported.append({
-                "image": image.copy(),
-                "duration_ms": 100
-            })
+            bounds = opaque_bounds(image)
 
-        if not imported:
-            QMessageBox.warning(
-                self,
-                "Ошибка импорта",
-                "Не удалось загрузить изображения."
+            if bounds is None:
+                add(
+                    f"{frame_label}: полностью прозрачный — в игре "
+                    "этого кадра не будет видно."
+                )
+                continue
+
+            images.append(image)
+            sizes.add((image.width(), image.height()))
+
+            if max(image.width(), image.height()) > 512:
+                add(
+                    f"{frame_label}: больше 512 px, текстура тяжёлая, "
+                    "а хитбокс задаётся отдельными полями."
+                )
+
+    if not images:
+        bounds = opaque_bounds(sprite) if sprite is not None else None
+
+        if bounds is None:
+            add("спрайт полностью прозрачный — в игре босса не будет видно.")
+        else:
+            images = [sprite]
+            sizes.add((sprite.width(), sprite.height()))
+
+    if len(sizes) > 1:
+        add("кадры разного размера: в лист они будут выровнены по центру.")
+
+    if len(images) > 1:
+        frame_height = max(image.height() for image in images)
+        total_height = frame_height * len(images)
+
+        if total_height > 4096:
+            add(
+                f"лист анимации выше 4096 px ({total_height}): "
+                "текстура может не загрузиться на слабых видеокартах."
             )
-            return
 
-        self.stop()
-        self.frames.extend(imported)
-        self.refresh_list()
-        self.frame_list.setCurrentRow(len(self.frames) - 1)
+    # --- рывок ---
+    if dash.get("enabled"):
+        interval = _clamped_int(dash.get("interval_ticks"), 300, 30, 36_000)
+        duration = _clamped_int(dash.get("duration_ticks"), 30, 5, 600)
+        dash_speed = _clamped_float(dash.get("speed"), 18.0, 1.0, 60.0)
 
-    # --------------------------------------------------------
-    # DISPLAY
-    # --------------------------------------------------------
-
-    def refresh_list(self):
-        self.frame_list.blockSignals(True)
-        self.frame_list.clear()
-
-        for index, frame in enumerate(self.frames):
-            pixmap = QPixmap.fromImage(frame["image"]).scaled(
-                64, 64,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation
+        if interval < 30:
+            add("интервал рывка меньше 0.5 секунды — босс будет дёргаться.")
+        if duration < 5:
+            add("рывок короче 5 тиков — его почти не будет видно.")
+        if duration >= interval:
+            add("рывок длится не меньше интервала — паузы между рывками нет.")
+        if dash_speed > 40:
+            add(f"скорость рывка {dash_speed:g} очень высокая.")
+        if not state_has_frames.get("attack"):
+            add(
+                "рывок включён, но у состояния «Атака» нет кадров: "
+                "действие будет без отдельной анимации."
             )
 
-            item = QListWidgetItem(
-                QIcon(pixmap),
-                f"Кадр {index + 1}  |  "
-                f"{frame['duration_ms']} мс"
+    # --- стрельба ---
+    if shoot.get("enabled"):
+        interval = _clamped_int(shoot.get("interval_ticks"), 180, 30, 36_000)
+        shot_damage = _clamped_int(shoot.get("damage"), 20, 0, 100_000)
+        count = _clamped_int(shoot.get("count"), 3, 1, 20)
+        spread = _clamped_float(shoot.get("spread_degrees"), 12.0, 0.0, 180.0)
+        shot_speed = _clamped_float(shoot.get("speed"), 8.0, 1.0, 60.0)
+        pattern = str(shoot.get("pattern", "fan"))
+        source = str(shoot.get("source", "vanilla"))
+
+        if interval < 30:
+            add("интервал стрельбы меньше 0.5 секунды — слишком часто.")
+        if shot_damage <= 0:
+            add("урон снаряда 0: выстрелы не будут наносить урон.")
+        if count > 10:
+            add(f"снарядов за выстрел: {count}, это очень много.")
+        if shot_speed > 40:
+            add(f"скорость снаряда {shot_speed:g} очень высокая.")
+
+        if pattern not in BOSS_SHOOT_PATTERN_CODES:
+            add(f"неизвестный узор стрельбы «{pattern}», будет веер.")
+            pattern = "fan"
+
+        if source not in BOSS_SHOOT_SOURCE_CODES:
+            add(f"неизвестный источник снаряда «{source}», будет ванильный.")
+            source = "vanilla"
+
+        if pattern in ("fan", "spiral") and spread <= 0:
+            add("разброс 0°: снаряды полетят в одну точку — для веера это мало.")
+
+        if pattern == "fan" and spread > 120:
+            add(f"разброс {spread:g}°: снаряды почти не летят в игрока.")
+
+        if pattern == "spiral":
+            step = _clamped_float(shoot.get("spiral_step"), 20.0, 1.0, 90.0)
+
+            if step < 5:
+                add("шаг спирали меньше 5°: снаряды слипнутся в одну линию.")
+
+        if source == "vanilla":
+            projectile = str(shoot.get("projectile", ""))
+
+            if projectile not in BOSS_PROJECTILE_CODES:
+                add(
+                    f"неизвестный снаряд «{projectile}» — будет "
+                    "использован DemonScythe."
+                )
+        else:
+            radius = _clamped_int(shoot.get("radius"), 12, 4, 64)
+            homing = _clamped_float(shoot.get("homing"), 0.0, 0.0, 1.0)
+            pierce = _clamped_int(shoot.get("pierce"), 1, 1, 10)
+            lifetime = _clamped_int(
+                shoot.get("lifetime_ticks"), 300, 60, 1800
+            )
+            color = QColor(str(shoot.get("color") or ""))
+
+            if not color.isValid():
+                add("цвет своего снаряда не распознан — будет оранжевый.")
+
+            if radius > 48:
+                add(f"радиус снаряда {radius} px: хитбокс будет огромным.")
+            if homing > 0.2:
+                add(
+                    f"самонаведение {homing:g}: снаряды почти не промахиваются, "
+                    "это может быть нечестно."
+                )
+            if pierce > 4:
+                add(f"пробивание {pierce}: снаряд проходит сквозь игрока много раз.")
+            if lifetime > 900:
+                add("снаряд живёт дольше 15 секунд — экран забьётся снарядами.")
+
+        if not state_has_frames.get("attack"):
+            add(
+                "стрельба включена, но у состояния «Атака» нет кадров: "
+                "выстрел будет без отдельной анимации."
             )
 
-            self.frame_list.addItem(item)
+    # --- призыв мобов ---
+    adds = _as_dict(actions.get("summon"))
 
-        self.frame_list.blockSignals(False)
-
-    def select_frame(self, index):
-        if not (0 <= index < len(self.frames)):
-            self.current_index = -1
-            return
-
-        self.current_index = index
-
-        frame = self.frames[index]
-
-        pixmap = QPixmap.fromImage(
-            frame["image"]
-        ).scaled(
-            280, 280,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.FastTransformation
+    if adds.get("enabled"):
+        interval = _clamped_int(
+            adds.get("interval_ticks"), 600, 60, 36_000
         )
+        count = _clamped_int(adds.get("count"), 1, 1, 10)
+        npc = normalize_adds_npc(adds.get("npc"))
 
-        self.preview.setPixmap(pixmap)
+        if not npc:
+            add(
+                "неизвестный моб призыва "
+                f"«{adds.get('npc')}» — призыв будет пропущен."
+            )
 
-        self.duration.blockSignals(True)
-        self.duration.setValue(frame["duration_ms"])
-        self.duration.blockSignals(False)
+        if interval < 120:
+            add("призыв чаще двух секунд: экран забьётся мобами.")
 
-    def update_duration(self, value):
-        index = self.current_index
+        if count > 5:
+            add(f"за один призыв {count} мобов — это очень много.")
 
-        if not (0 <= index < len(self.frames)):
-            return
+    # --- фазы ---
+    raw_phases = _as_list(data.get("phases"))
+    phases = normalize_boss_phases(raw_phases)
 
-        self.frames[index]["duration_ms"] = value
+    if len(phases) > 1:
+        thresholds = []
 
-        self.refresh_list()
-        self.frame_list.setCurrentRow(index)
+        for entry in raw_phases:
+            entry = _as_dict(entry)
+            thresholds.append(
+                _clamped_float(entry.get("threshold"), 1.0, 0.0, 1.0)
+            )
 
-    def set_loop(self, enabled):
-        self.loop = enabled
+        if not all(a > b for a, b in zip(thresholds, thresholds[1:])):
+            add("пороги фаз должны убывать: 100% → 60% → 30%.")
 
-    # --------------------------------------------------------
-    # PLAYBACK
-    # --------------------------------------------------------
+        for index, phase in enumerate(phases, 1):
+            if index == 1:
+                continue
 
-    def play(self):
-        if not self.frames:
-            return
+            if phase["speed_multiplier"] > 3:
+                add(f"фаза {index}: скорость ×{phase['speed_multiplier']:g} — это очень много.")
+            if phase["attack_multiplier"] > 3:
+                add(f"фаза {index}: атаки ×{phase['attack_multiplier']:g} — это очень много.")
 
-        if self.current_index < 0:
-            self.frame_list.setCurrentRow(0)
+        if len(phases) > 5:
+            add(f"фаз {len(phases)}: игрок вряд ли заметит столько переходов.")
 
-        self.timer.start(
-            self.frames[self.current_index]["duration_ms"]
-        )
+    # --- защита ---
+    immunities = _as_list(defense.get("immunities"))
+    known_immunities = [
+        code for code in immunities if code in BOSS_BUFF_CODES
+    ]
 
-    def stop(self):
-        self.timer.stop()
+    for code in immunities:
+        if code not in BOSS_BUFF_CODES:
+            add(f"неизвестный иммунитет «{code}» — будет пропущен.")
 
-    def next_frame(self):
-        if not self.frames:
-            self.stop()
-            return
+    if contact.get("enabled"):
+        buff = str(contact.get("buff", ""))
 
-        next_index = self.current_index + 1
+        if buff not in BOSS_BUFF_CODES:
+            add(f"неизвестный дебафф касания «{buff}» — будет OnFire.")
+        if not known_immunities:
+            add(
+                "босс накладывает дебафф, но не имеет иммунитетов: "
+                "себя он тоже сможет поджечь (обычно это не мешает)."
+            )
 
-        if next_index >= len(self.frames):
-            if self.loop:
-                next_index = 0
-            else:
-                self.stop()
-                return
+    # --- призыв и рецепт ---
+    summon = _as_dict(data.get("summon"))
+    recipe = _as_dict(summon.get("recipe"))
 
-        self.frame_list.setCurrentRow(next_index)
+    if recipe.get("enabled"):
+        if not summon.get("enabled", True):
+            add("рецепт призыва включён, но сам предмет-призыв отключён.")
 
-        self.timer.start(
-            self.frames[next_index]["duration_ms"]
-        )
+        ingredient = str(recipe.get("item", ""))
+
+        if ingredient not in BOSS_RECIPE_INGREDIENT_CODES:
+            add(
+                f"неизвестный ингредиент рецепта «{ingredient}» — "
+                "рецепт будет пропущен."
+            )
+
+        station = str(recipe.get("station", ""))
+
+        if station and station not in BOSS_RECIPE_STATION_CODES:
+            add(
+                f"неизвестная станция рецепта «{station}» — "
+                "рецепт будет без станции."
+            )
+
+        if _clamped_int(recipe.get("count"), 5, 1, 999) > 99:
+            add("ингредиентов больше 99 — рецепт будет выглядеть странно.")
+
+    # --- мешок с лутом ---
+    bag = _as_dict(data.get("bag"))
+
+    if bag.get("enabled"):
+        if not _as_list(data.get("loot")):
+            add(
+                "мешок с лутом включён, но таблица дропа пуста — "
+                "мешок не создастся."
+            )
+
+    music = str(data.get("music", ""))
+    known_music = {code for _label, code in BOSS_MUSIC_OPTIONS}
+
+    if music and music not in known_music:
+        add(f"неизвестная музыка «{music}» — будет обычная боевая тема.")
+
+    return issues
 
 
+def prepare_boss_phases(data):
+    """Фазы, готовые для генератора: те же правила, что и в редакторе."""
 
-# ============================================================
-# MAIN WINDOW
-# ============================================================
+    return normalize_boss_phases(_as_dict(data).get("phases"))
 
-class TMCWindow(QMainWindow):
 
-    # Общие категории объектов проекта.
-    # Пока полноценный редактор есть только у предметов.
-    OBJECT_TYPES = (
-        "items",
-        "accessories",
-        "npcs",
-        "mobs",
-        "bosses"
-    )
+class BossEditor(QWidget):
+    """Форма босса: свойства, бой, фазы, защита, дроп, скрипт и анимации."""
 
-    CONTENT_FOLDERS = {
-        "items": "Items",
-        "accessories": "Accessories",
-        "npcs": "NPCs",
-        "mobs": "Mobs",
-        "bosses": "Bosses"
-    }
-
-    OBJECT_LABELS = {
-        "items": "предмет",
-        "accessories": "аксессуар",
-        "npcs": "NPC",
-        "mobs": "моба",
-        "bosses": "босса"
-    }
-
-    OBJECT_KINDS = {
-        "accessories": "accessory",
-        "npcs": "npc",
-        "mobs": "mob",
-        "bosses": "boss"
-    }
-
-    ID_PATTERN = re.compile(r"[a-zA-Z][a-zA-Z0-9_]*")
-
-    @classmethod
-    def is_valid_id(cls, value):
-        return isinstance(value, str) and bool(
-            cls.ID_PATTERN.fullmatch(value)
-        )
-
-    def discard_path(self, root, path):
-        """Переносит файл или папку в .trash вместо безвозвратного удаления."""
-
-        stamp = getattr(self, "trash_stamp", None) or datetime.now().strftime(
-            "%Y%m%d_%H%M%S"
-        )
-        target = root / ".trash" / stamp / path.relative_to(root)
-        target.parent.mkdir(parents=True, exist_ok=True)
-
-        number = 1
-        base = target
-        while target.exists():
-            target = base.with_name(f"{base.name}.{number}")
-            number += 1
-
-        shutil.move(str(path), str(target))
+    # Живая сводка для левой панели: данные и текущий ключ.
+    changed = Signal(dict, str)
 
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Terraria Mod Creator")
-        self.resize(1150, 760)
+        self.loading = False
+        self._data = {}
+        self.sprite = QImage()
+        self.item_choices = []
+        self.animation_editors = {}
+        self.immunity_boxes = {}
+        self.shoot_color = QColor(DEFAULT_SHOOT["color"])
 
-        # Путь к корневой папке проекта
-        self.project_path = None
+        self.issue_timer = QTimer(self)
+        self.issue_timer.setSingleShot(True)
+        self.issue_timer.setInterval(250)
+        self.issue_timer.timeout.connect(self.refresh_issues)
 
-        # Единое хранилище объектов, разделённое по типам.
-        # self.items остаётся совместимым псевдонимом для предметов.
-        self.objects = {
-            object_type: {}
-            for object_type in self.OBJECT_TYPES
-        }
-        self.items = self.objects["items"]
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 6, 0, 0)
+        root.setSpacing(6)
 
-        self.current_key = None
-        self.current_keys = {
-            object_type: None
-            for object_type in self.OBJECT_TYPES
-        }
-        self.loading_item = False
-        self.current_object_type = "items"
-
-        self.build_ui()
-        self.build_menu()
-
-        self.create_default_item()
-
-    # ========================================================
-    # MENU
-    # ========================================================
-
-    def build_menu(self):
-        menu = self.menuBar().addMenu("Файл")
-
-        actions = [
-            ("Новый проект", self.new_project),
-            ("Открыть проект", self.open_project),
-            ("Сохранить проект", self.save_project),
-        ]
-
-        for title, callback in actions:
-            action = QAction(title, self)
-            action.triggered.connect(callback)
-            menu.addAction(action)
-
-    # ========================================================
-    # UI
-    # ========================================================
-
-    def build_ui(self):
-
-        self.setStyleSheet(build_stylesheet(build_ui_assets()))
-
-        central = QWidget()
-        self.setCentralWidget(central)
-
-        root = QVBoxLayout(central)
-        root.setContentsMargins(14, 6, 14, 10)
-        root.setSpacing(10)
-
-        # HEADER
-
-        header = QHBoxLayout()
-
-        header.setContentsMargins(4, 0, 4, 0)
-        header.setSpacing(0)
-
-        logo = QLabel()
-        logo.setPixmap(build_logo_pixmap())
-
-        title = QLabel("TMC")
-        title.setObjectName("appTitle")
-
-        subtitle = QLabel("Terraria Mod Creator")
-        subtitle.setObjectName("appSubtitle")
-
-        header.addWidget(logo)
-        header.addSpacing(12)
-        header.addWidget(title)
-        header.addSpacing(12)
-        header.addWidget(subtitle)
-        header.addStretch()
-
-        self.project_label = QLabel("Проект не сохранён")
-        self.project_label.setObjectName("projectLabel")
-
-        header.addWidget(self.project_label)
-
-        root.addLayout(header)
-
-        # MAIN SPLITTER
-
-        splitter = QSplitter()
-        root.addWidget(splitter, 1)
-
-        # SIDEBAR
-
-        sidebar = QWidget()
-        sidebar.setObjectName("projectSidebar")
-        sidebar.setMinimumWidth(210)
-        sidebar.setMaximumWidth(290)
-
-        side = QVBoxLayout(sidebar)
-        side.setContentsMargins(14, 12, 14, 14)
-        side.setSpacing(8)
-
-        sidebar_title = section_label("Объекты проекта")
-        side.addWidget(sidebar_title)
-
-        self.category_names = {
-            "items": "Предметы",
-            "accessories": "Аксессуары",
-            "npcs": "NPC",
-            "mobs": "Мобы",
-            "bosses": "Боссы"
-        }
-
-        self.content_type = QComboBox()
-        self.content_type.addItems([
-            self.category_names[object_type]
-            for object_type in self.OBJECT_TYPES
-        ])
-        self.content_type.currentIndexChanged.connect(
-            self.change_object_type
-        )
-        side.addWidget(self.content_type)
-
-        self.object_list = QListWidget()
-        self.object_list.setIconSize(QSize(28, 28))
-        self.object_list.currentRowChanged.connect(
-            self.on_item_selected
-        )
-        self.object_list.itemDoubleClicked.connect(
-            self.edit_generic_object
-        )
-        side.addWidget(self.object_list, 1)
-
-        self.category_hint = QLabel()
-        self.category_hint.setWordWrap(True)
-        self.category_hint.setObjectName("hint")
-        self.category_hint.setText(
-            "Редактор предметов доступен полностью."
-        )
-        side.addWidget(self.category_hint)
-
-        self.add_object_btn = QPushButton("+ Создать предмет")
-        self.add_object_btn.setProperty("accent", True)
-        self.add_object_btn.clicked.connect(self.add_item)
-
-        self.duplicate_object_btn = QPushButton("Дублировать")
-        self.duplicate_object_btn.clicked.connect(self.duplicate_item)
-
-        self.delete_object_btn = QPushButton("Удалить")
-        self.delete_object_btn.setProperty("danger", True)
-        self.delete_object_btn.clicked.connect(self.delete_item)
-
-        side.addWidget(self.add_object_btn)
-        side.addWidget(self.duplicate_object_btn)
-        side.addWidget(self.delete_object_btn)
-
-        splitter.addWidget(sidebar)
-
-        # EDITOR
-
-        editor = QWidget()
-        editor.setObjectName("editorPanel")
-        self.editor_panel = editor
-        editor_layout = QVBoxLayout(editor)
+        self.title_label = section_label("Босс не выбран")
+        root.addWidget(self.title_label)
 
         self.tabs = QTabWidget()
-        editor_layout.addWidget(self.tabs)
+        root.addWidget(self.tabs, 1)
 
-        self.build_properties_tab()
-        self.build_combat_tab()
+        self.build_general_tab()
+        self.build_attacks_tab()
+        self.build_defense_tab()
+        self.build_phases_tab()
+        self.build_loot_tab()
+        self.build_script_tab()
         self.build_sprite_tab()
         self.build_animation_tab()
-        self.build_generator_tab()
+        self.build_preview_tab()
 
-        save_btn = QPushButton("Сохранить проект")
-        save_btn.setProperty("primary", True)
-        save_btn.setMinimumWidth(180)
-        save_btn.clicked.connect(self.save_project)
+        self.issues_label = QLabel()
+        self.issues_label.setObjectName("hint")
+        self.issues_label.setWordWrap(True)
+        root.addWidget(self.issues_label)
 
-        editor_layout.addWidget(
-            save_btn,
-            alignment=Qt.AlignmentFlag.AlignRight
+        hint = QLabel(
+            "Изменения сохраняются автоматически: при переключении объекта, "
+            "категории или сохранении проекта. Генератор мода создаст класс "
+            "босса, его иконку для карты, собственный снаряд (если выбран) "
+            "и, если включено, мешок с лутом и предмет-призыв."
         )
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
 
-        splitter.addWidget(editor)
-        splitter.setSizes([250, 900])
+        self.name.textChanged.connect(self.update_title)
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        self.connect_change_signals()
+        self.clear()
 
-        self.statusBar().showMessage("TMC готов")
+    # --------------------------------------------------------
+    # TABS
+    # --------------------------------------------------------
 
-        self.inventory_preview = InventoryPreview()
+    def build_general_tab(self):
+        tab, form = make_scroll_form_tab(780)
+        self.general_form = form
 
-        self.tabs.addTab(
-            self.inventory_preview,
-            "Предпросмотр Terraria"
+        form.addRow(section_label("ШАБЛОН"))
+
+        template_row = QWidget()
+        template_layout = QHBoxLayout(template_row)
+        template_layout.setContentsMargins(0, 0, 0, 0)
+        template_layout.setSpacing(8)
+
+        self.template_box = QComboBox()
+
+        for template in BOSS_TEMPLATES:
+            self.template_box.addItem(template["title"])
+
+        self.template_button = QPushButton("Применить шаблон")
+        self.template_button.clicked.connect(self.apply_template)
+
+        template_layout.addWidget(self.template_box, 1)
+        template_layout.addWidget(self.template_button)
+
+        form.addRow(template_row)
+
+        self.template_hint = QLabel()
+        self.template_hint.setObjectName("hint")
+        self.template_hint.setWordWrap(True)
+        form.addRow(self.template_hint)
+
+        self.template_box.currentIndexChanged.connect(
+            self.update_template_hint
         )
+        self.update_template_hint()
 
-        self.resource_manager = ResourceManager()
-
-        self.tabs.addTab(
-            self.resource_manager,
-            "Менеджер ресурсов"
-        )
-        self.resource_manager.image_selected.connect(
-            self.apply_resource_to_item
-        )
-        
-        self.setup_shortcuts()
-
-        self.connect_item_card()
-
-    def build_generator_tab(self):
-        """Настройки и запуск генерации базового мода tModLoader."""
-
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-
-        intro = QLabel(
-            "Генерация структуры мода tModLoader из предметов проекта. "
-            "На этом этапе поддерживаются предметы; остальные категории "
-            "будут подключены после появления специализированных редакторов.\n"
-            "Для сборки в tModLoader создай пустой мод с тем же именем "
-            "(Create Mod) и выбери ModSources как папку вывода: TMC "
-            "не перезаписывает чужие файлы."
-        )
-        intro.setWordWrap(True)
-        intro.setObjectName("hint")
-        layout.addWidget(intro)
-
-        form = QFormLayout()
-        style_form(form)
-        form.setContentsMargins(0, 8, 0, 8)
-
-        self.generator_mod_name = QLineEdit("MyTerrariaMod")
-        self.generator_mod_author = QLineEdit("TMC User")
-        self.generator_mod_version = QLineEdit("0.1")
-        self.generator_mod_description = QLineEdit(
-            "A Terraria mod created with Terraria Mod Creator."
-        )
-
-        form.addRow("Внутреннее имя мода", self.generator_mod_name)
-        form.addRow("Автор", self.generator_mod_author)
-        form.addRow("Версия", self.generator_mod_version)
-        form.addRow("Описание", self.generator_mod_description)
-        layout.addLayout(form)
-
-        self.generator_output_label = QLabel(
-            "Папка вывода: проект/Export"
-        )
-        self.generator_output_label.setWordWrap(True)
-        self.generator_output_label.setObjectName("hint")
-        layout.addWidget(self.generator_output_label)
-
-        output_row = QHBoxLayout()
-        choose_output_btn = QPushButton("Выбрать папку вывода")
-        choose_output_btn.clicked.connect(self.choose_generator_output)
-        output_row.addWidget(choose_output_btn)
-        output_row.addStretch()
-        layout.addLayout(output_row)
-
-        self.generator_log = QPlainTextEdit()
-        self.generator_log.setReadOnly(True)
-        self.generator_log.setPlaceholderText(
-            "Здесь появится отчёт о генерации..."
-        )
-        layout.addWidget(self.generator_log, 1)
-
-        generate_btn = QPushButton("Сгенерировать мод")
-        generate_btn.setProperty("accent", True)
-        generate_btn.clicked.connect(self.generate_mod)
-        layout.addWidget(
-            generate_btn,
-            alignment=Qt.AlignmentFlag.AlignRight
-        )
-
-        self.generator_output_dir = None
-        self.tabs.addTab(tab, "Генератор мода")
-
-    def refresh_item_card(self, *_):
-        card = getattr(self, "item_card", None)
-
-        if card is None or not hasattr(self, "mana"):
-            return
-
-        canvas = getattr(self, "canvas", None)
-
-        card.update_card(
-            name=self.name.text(),
-            rarity=self.rarity.currentText(),
-            category=self.category.currentText(),
-            description=self.description.text(),
-            sprite=canvas.get_image() if canvas is not None else None,
-            damage=self.damage.value(),
-            damage_type=self.damage_type.currentText(),
-            crit=self.crit.value(),
-            use_time=self.use_time.value(),
-            mana=self.mana.value(),
-            knockback=self.knockback.value(),
-            price=self.price.value()
-        )
-
-    def connect_item_card(self):
-        for signal in (
-            self.name.textChanged,
-            self.description.textChanged,
-            self.rarity.currentTextChanged,
-            self.category.currentTextChanged,
-            self.price.valueChanged,
-            self.damage.valueChanged,
-            self.crit.valueChanged,
-            self.use_time.valueChanged,
-            self.mana.valueChanged,
-            self.knockback.valueChanged,
-            self.damage_type.currentTextChanged,
-            self.tabs.currentChanged,
-            self.object_list.currentRowChanged,
-        ):
-            signal.connect(self.refresh_item_card)
-
-        self.refresh_item_card()
-
-    def reset_generator_output(self):
-        self.generator_output_dir = None
-        self.generator_output_label.setText(
-            "Папка вывода: проект/Export"
-        )
-
-    def choose_generator_output(self):
-        if self.project_path is None:
-            QMessageBox.warning(
-                self,
-                "Нет проекта",
-                "Сначала создай или открой проект."
-            )
-            return
-
-        default_dir = self.generator_output_dir or (
-            self.project_path / "Export"
-        )
-        default_dir.mkdir(parents=True, exist_ok=True)
-
-        selected = QFileDialog.getExistingDirectory(
-            self,
-            "Выбери папку, в которую будет помещён мод",
-            str(default_dir)
-        )
-
-        if selected:
-            self.generator_output_dir = Path(selected)
-            self.generator_output_label.setText(
-                f"Папка вывода: {self.generator_output_dir}"
-            )
-
-    @staticmethod
-    def _cs_string(value):
-        """Экранирует строку для литерала C#."""
-        value = str(value)
-        return (
-            value.replace("\\", "\\\\")
-            .replace('"', '\\"')
-            .replace("\r", "\\r")
-            .replace("\n", "\\n")
-            .replace("\t", "\\t")
-        )
-
-    @staticmethod
-    def _hjson_string(value):
-        """JSON-совместимая строка подходит и для HJSON-локализации."""
-        return json.dumps(str(value), ensure_ascii=False)
-
-    @staticmethod
-    def build_animation_sheet(animation_frames):
-        """Объединяет кадры анимации в вертикальный spritesheet."""
-        valid_frames = []
-
-        for frame in animation_frames:
-            image = frame.get("image")
-            if image is None or image.isNull():
-                raise ValueError("В анимации найден пустой или повреждённый кадр.")
-            valid_frames.append(frame)
-
-        if len(valid_frames) < 2:
-            return None
-
-        frame_width = max(frame["image"].width() for frame in valid_frames)
-        frame_height = max(frame["image"].height() for frame in valid_frames)
-
-        if frame_width <= 0 or frame_height <= 0:
-            raise ValueError("Размеры кадров анимации должны быть больше нуля.")
-
-        sheet = QImage(
-            frame_width,
-            frame_height * len(valid_frames),
-            QImage.Format.Format_ARGB32
-        )
-        sheet.fill(Qt.GlobalColor.transparent)
-
-        painter = QPainter(sheet)
-        try:
-            for index, frame in enumerate(valid_frames):
-                image = frame["image"]
-                x = (frame_width - image.width()) // 2
-                y = index * frame_height + (frame_height - image.height()) // 2
-                painter.drawImage(x, y, image)
-        finally:
-            painter.end()
-
-        return sheet
-
-    @staticmethod
-    def animation_durations_to_ticks(animation_frames):
-        """Переводит миллисекунды редактора в игровые тики Terraria (60 Гц)."""
-        durations = []
-
-        for frame in animation_frames:
-            duration_ms = max(1, int(frame.get("duration_ms", 100)))
-            ticks = max(1, (duration_ms * 60 + 500) // 1000)
-            durations.append(ticks)
-
-        return durations
-
-    def build_item_source(self, mod_name, item_id, data, sprite, animation=None):
-        combat = data.get("combat", {})
-        animation = animation or {}
-        frame_ticks = animation.get("frame_ticks", [])
-        animation_loop = bool(animation.get("loop", True))
-        animated = len(frame_ticks) > 1
-
-        rarity_map = {
-            "Обычная": "White",
-            "Необычная": "Blue",
-            "Редкая": "Green",
-            "Очень редкая": "Orange",
-            "Эпическая": "LightRed",
-            "Легендарная": "Yellow",
-            "Мифическая": "Purple"
-        }
-        damage_type_map = {
-            "Melee": "Melee",
-            "Ranged": "Ranged",
-            "Magic": "Magic",
-            "Summon": "Summon",
-            "Generic": "Generic"
-        }
-
-        rarity = rarity_map.get(data.get("rarity"), "White")
-        damage_type = damage_type_map.get(
-            combat.get("damage_type"), "Generic"
-        )
-
-        width = max(1, sprite.width()) if sprite is not None else 32
-        height = max(1, sprite.height()) if sprite is not None else 32
-        if animated:
-            height = max(1, height // len(frame_ticks))
-        damage = max(0, int(combat.get("damage", 0)))
-
-        lines = [
-            "using System;",
-            "using Microsoft.Xna.Framework;",
-            "using Microsoft.Xna.Framework.Graphics;",
-            "using Terraria;",
-            "using Terraria.DataStructures;",
-            "using Terraria.GameContent;",
-            "using Terraria.ID;",
-            "using Terraria.ModLoader;",
-            "",
-            f"namespace {mod_name}.Content.Items",
-            "{",
-            f"    public class {item_id} : ModItem",
-            "    {",
-        ]
-
-        if animated:
-            ticks_literal = ", ".join(str(max(1, int(tick))) for tick in frame_ticks)
-            lines.extend([
-                f"        private static readonly int[] FrameDurations = new int[] {{ {ticks_literal} }};",
-                f"        private const bool LoopAnimation = {str(animation_loop).lower()};",
-                "",
-                "        public override void SetStaticDefaults()",
-                "        {",
-                "            ItemID.Sets.AnimatesAsSoul[Type] = true;",
-                "            Main.RegisterItemAnimation(Type, new TMCItemAnimation());",
-                "        }",
-                "",
-                "        private sealed class TMCItemAnimation : DrawAnimationVertical",
-                "        {",
-                "            private uint startTick;",
-                "            private bool hasStarted;",
-                "",
-                "            public TMCItemAnimation() : base(1, FrameDurations.Length)",
-                "            {",
-                "            }",
-                "",
-                "            // Terraria может запрашивать кадр разное число раз за игровой тик",
-                "            // в интерфейсе и при отрисовке предмета в мире.",
-                "            // Поэтому Update не изменяет кадр: он вычисляется по GameUpdateCount.",
-                "            public override void Update()",
-                "            {",
-                "            }",
-                "",
-                "            public override Rectangle GetFrame(Texture2D texture, int frameCounterOverride = -1)",
-                "            {",
-                "                if (!hasStarted)",
-                "                {",
-                "                    startTick = Main.GameUpdateCount;",
-                "                    hasStarted = true;",
-                "                }",
-                "",
-                "                ulong elapsedTicks = (ulong)(Main.GameUpdateCount - startTick);",
-                "                ulong totalDuration = 0UL;",
-                "                foreach (int duration in FrameDurations)",
-                "                    totalDuration += (ulong)Math.Max(1, duration);",
-                "",
-                "                if (LoopAnimation && totalDuration > 0UL)",
-                "                    elapsedTicks %= totalDuration;",
-                "",
-                "                if (!LoopAnimation && elapsedTicks >= totalDuration)",
-                "                {",
-                "                    Frame = FrameCount - 1;",
-                "                }",
-                "                else",
-                "                {",
-                "                    Frame = 0;",
-                "                    for (int i = 0; i < FrameDurations.Length; i++)",
-                "                    {",
-                "                        int duration = Math.Max(1, FrameDurations[i]);",
-                "                        if (elapsedTicks < (ulong)duration)",
-                "                        {",
-                "                            Frame = i;",
-                "                            break;",
-                "                        }",
-                "",
-                "                        elapsedTicks -= (ulong)duration;",
-                "                    }",
-                "                }",
-                "",
-                "                FrameCounter = 0;",
-                "                return base.GetFrame(texture, frameCounterOverride);",
-                "            }",
-                "        }",
-                ""
-            ])
-
-        lines.extend([
-            "        public override void SetDefaults()",
-            "        {",
-            f"            Item.width = {width};",
-            f"            Item.height = {height};",
-            f"            Item.maxStack = {max(1, int(data.get('max_stack', 1)))};",
-            f"            Item.value = {max(0, int(data.get('price_copper', 0)))};",
-            f"            Item.rare = ItemRarityID.{rarity};",
-        ])
-
-        # Боевые параметры и анимация использования нужны только оружию:
-        # иначе любой материал можно было бы «взмахнуть» в игре.
-        if damage > 0:
-            lines.extend([
-                "            Item.useStyle = ItemUseStyleID.Swing;",
-                f"            Item.damage = {damage};",
-                f"            Item.knockBack = {max(0.0, float(combat.get('knockback', 0.0))):g}f;",
-                f"            Item.useTime = {max(1, int(combat.get('use_time', 20)))};",
-                f"            Item.useAnimation = {max(1, int(combat.get('use_animation', 20)))};",
-                f"            Item.crit = {int(combat.get('crit', 4))};",
-                f"            Item.mana = {max(0, int(combat.get('mana', 0)))};",
-                f"            Item.shootSpeed = {max(0.0, float(combat.get('shoot_speed', 0.0))):g}f;",
-                f"            Item.autoReuse = {str(bool(combat.get('auto_reuse', False))).lower()};",
-                f"            Item.DamageType = DamageClass.{damage_type};",
-            ])
-
-        lines.extend([
-            "        }",
-            "    }",
-            "}",
-            ""
-        ])
-        return "\n".join(lines)
-
-    def generate_mod(self):
-        """Создаёт базовый tModLoader-мод и переносит предметы проекта."""
-
-        if self.project_path is None:
-            QMessageBox.warning(
-                self,
-                "Нет проекта",
-                "Сначала создай или открой проект."
-            )
-            return
-
-        if not self.save_current_item():
-            return
-
-        mod_name = self.generator_mod_name.text().strip()
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", mod_name):
-            QMessageBox.warning(
-                self,
-                "Некорректное имя мода",
-                "Внутреннее имя должно начинаться с латинской буквы "
-                "и содержать только латинские буквы, цифры и _."
-            )
-            return
-
-        if mod_name in CSHARP_KEYWORDS:
-            QMessageBox.warning(
-                self,
-                "Некорректное имя мода",
-                f"«{mod_name}» — зарезервированное слово C#. "
-                "Выбери другое имя."
-            )
-            return
-
-        version = self.generator_mod_version.text().strip()
-        if not version or any(ch in version for ch in "\r\n"):
-            QMessageBox.warning(
-                self,
-                "Некорректная версия",
-                "Укажи непустую версию в одну строку."
-            )
-            return
-
-        # Сначала фиксируем актуальное состояние проекта на диске.
-        # Экспортировать можно только успешно сохранённое состояние.
-        if not self.save_project():
-            self.generator_log.setPlainText(
-                "Генерация отменена: проект не удалось сохранить."
-            )
-            return
-
-        output_root = self.generator_output_dir or (
-            self.project_path / "Export"
-        )
-        mod_root = output_root / mod_name
-
-        try:
-            output_root.mkdir(parents=True, exist_ok=True)
-            mod_root.mkdir(parents=True, exist_ok=True)
-
-            # Убираем только файлы, созданные предыдущим запуском TMC.
-            # Пользовательские файлы, которых нет в манифесте, не трогаем.
-            manifest_path = mod_root / ".tmc_generated.json"
-            if manifest_path.exists():
-                try:
-                    previous_manifest = json.loads(
-                        manifest_path.read_text(encoding="utf-8")
-                    )
-                except (OSError, ValueError):
-                    previous_manifest = {}
-
-                for relative_name in previous_manifest.get("files", []):
-                    previous_file = (mod_root / relative_name).resolve()
-                    try:
-                        previous_file.relative_to(mod_root.resolve())
-                    except ValueError:
-                        continue
-                    if previous_file.is_file():
-                        previous_file.unlink()
-
-            generated_files = []
-            warnings = []
-
-            (mod_root / "Content" / "Items").mkdir(
-                parents=True, exist_ok=True
-            )
-
-            def write_text(relative, text):
-                """Пишет файл, но не затирает чужие (не созданные TMC)."""
-
-                target = mod_root / relative
-
-                # Файлы прошлой генерации уже удалены выше,
-                # значит существующий файл — чужой.
-                if target.exists():
-                    warnings.append(
-                        f"{relative} уже существует и создан не TMC — "
-                        "не перезаписан."
-                    )
-                    return False
-
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(text, encoding="utf-8")
-                generated_files.append(relative)
-                return True
-
-            author = " ".join(
-                self.generator_mod_author.text().splitlines()
-            ).strip()
-            description_text = " ".join(
-                self.generator_mod_description.text().splitlines()
-            ).strip()
-
-            build_text = "\n".join([
-                f"displayName = {mod_name}",
-                f"author = {author}",
-                f"version = {version}",
-                f"description = {description_text}",
-                ""
-            ])
-            write_text("build.txt", build_text)
-
-            write_text(
-                f"{mod_name}.cs",
-                "using Terraria.ModLoader;\n\n"
-                f"namespace {mod_name}\n"
-                "{\n"
-                f"    public class {mod_name} : Mod\n"
-                "    {\n"
-                "    }\n"
-                "}\n"
-            )
-
-            if not any(mod_root.glob("*.csproj")):
-                warnings.append(
-                    f"Нет {mod_name}.csproj: tModLoader не соберёт мод без него. "
-                    "Создай пустой мод с тем же именем в tModLoader "
-                    "(Workshop → Develop Mods → Create Mod), выбери "
-                    "ModSources как папку вывода и сгенерируй мод заново."
-                )
-
-            localization = [
-                "Mods: {",
-                f"    {mod_name}: {{",
-                "        Items: {"
-            ]
-            generated = 0
-
-            for item_id, obj in self.items.items():
-                if not self.is_valid_id(item_id) or item_id in CSHARP_KEYWORDS:
-                    warnings.append(f"Пропущен предмет с некорректным ID: {item_id}")
-                    continue
-
-                data = obj.get("data", {})
-                sprite = obj.get("sprite")
-                if sprite is None or sprite.isNull():
-                    warnings.append(f"У {item_id} отсутствует корректный спрайт.")
-                    continue
-
-                relative_cs = f"Content/Items/{item_id}.cs"
-                relative_png = f"Content/Items/{item_id}.png"
-
-                if (mod_root / relative_cs).exists() or (
-                    mod_root / relative_png
-                ).exists():
-                    warnings.append(
-                        f"{item_id}: файл уже существует и создан не TMC — "
-                        "предмет пропущен."
-                    )
-                    continue
-
-                animation = obj.get("animation", {})
-                animation_frames = animation.get("frames", [])
-                export_sprite = sprite
-                animation_config = {
-                    "loop": animation.get("loop", True),
-                    "frame_ticks": []
-                }
-
-                if len(animation_frames) > 1:
-                    export_sprite = self.build_animation_sheet(animation_frames)
-                    animation_config["frame_ticks"] = (
-                        self.animation_durations_to_ticks(animation_frames)
-                    )
-
-                write_text(
-                    relative_cs,
-                    self.build_item_source(
-                        mod_name,
-                        item_id,
-                        data,
-                        export_sprite,
-                        animation_config
-                    )
-                )
-
-                texture_path = mod_root / relative_png
-                if not export_sprite.save(str(texture_path), "PNG"):
-                    raise OSError(f"Не удалось сохранить спрайт {item_id}.")
-                generated_files.append(relative_png)
-
-                display_name = self._hjson_string(data.get("name", item_id))
-                description = self._hjson_string(data.get("description", ""))
-                localization.extend([
-                    f"            {item_id}: {{",
-                    f"                DisplayName: {display_name}",
-                    f"                Tooltip: {description}",
-                    "            }"
-                ])
-                generated += 1
-
-            localization.extend(["        }", "    }", "}"])
-            localization_text = "\n".join(localization) + "\n"
-            localization_extra = ""
-
-            if not write_text("Localization/en-US.hjson", localization_text):
-                localization_extra = (
-                    "\n\nТексты названий и описаний для вставки вручную "
-                    "в существующий Localization/en-US.hjson:\n\n"
-                    + localization_text
-                )
-
-            manifest_path.write_text(
-                json.dumps(
-                    {"generator": "TMC", "version": 1, "files": generated_files},
-                    ensure_ascii=False,
-                    indent=2
-                ),
-                encoding="utf-8"
-            )
-
-            report = [
-                f"Мод создан: {mod_root}",
-                f"Сгенерировано предметов: {generated}",
-                "Созданы build.txt, главный класс мода, C#-классы, "
-                "PNG-текстуры/спрайт-листы и Localization/en-US.hjson."
-            ]
-
-            other_count = sum(
-                len(self.objects[kind])
-                for kind in self.OBJECT_TYPES
-                if kind != "items"
-            )
-            if other_count:
-                warnings.append(
-                    f"Другие объекты ({other_count}) пока не генерируются: "
-                    "для них ещё нет специализированных параметров."
-                )
-
-            if warnings:
-                report.append("\nПредупреждения:")
-                report.extend(f"• {warning}" for warning in warnings)
-
-            self.generator_log.setPlainText(
-                "\n".join(report) + localization_extra
-            )
-            self.statusBar().showMessage(
-                f"Генерация завершена: {generated} предметов"
-            )
-            QMessageBox.information(
-                self,
-                "Генерация завершена",
-                f"Создан мод {mod_name}.\nПредметов: {generated}\n\n"
-                f"Путь: {mod_root}"
-            )
-
-        except Exception as exc:
-            self.generator_log.setPlainText(
-                f"Ошибка генерации:\n{exc}"
-            )
-            QMessageBox.critical(
-                self,
-                "Ошибка генерации",
-                str(exc)
-            )
-
-    def build_animation_tab(self):
-        self.animation_editor = AnimationEditor()
-
-        self.animation_editor.add_frame_requested.connect(
-            self.add_current_sprite_frame
-        )
-
-        self.tabs.addTab(
-            self.animation_editor,
-            "Анимация"
-        )
-
-
-    def add_current_sprite_frame(self):
-        image = self.canvas.get_image()
-
-        self.animation_editor.add_frame(image)
-
-        self.statusBar().showMessage(
-            "Кадр добавлен в анимацию."
-        )
-    
-    # ========================================================
-    # PROPERTIES TAB
-    # ========================================================
-
-    def build_properties_tab(self):
-
-        tab = QWidget()
-        outer = QHBoxLayout(tab)
-        outer.setSpacing(28)
-
-        form_host = QWidget()
-        form_host.setMaximumWidth(680)
-        form = QFormLayout(form_host)
-        style_form(form)
-
-        self.item_card = ItemCard()
-
-        outer.addWidget(form_host, 1, Qt.AlignmentFlag.AlignTop)
-        outer.addWidget(self.item_card, 0, Qt.AlignmentFlag.AlignTop)
+        form.addRow(section_label("СВОЙСТВА"))
 
         self.name = QLineEdit()
         self.internal_id = QLineEdit()
 
-        self.description = QLineEdit()
+        self.description = QPlainTextEdit()
+        self.description.setMaximumHeight(90)
 
-        self.category = QComboBox()
-        self.category.addItems([
-            "Материал",
-            "Декоративный предмет",
-            "Мебель",
-            "Косметический предмет",
-            "Визуальный питомец",
-            "Прочее"
-        ])
+        self.summon_enabled = QCheckBox("Создавать предмет-призыв")
+        self.summon_enabled.setChecked(True)
+        self.summon_enabled.setToolTip(
+            "Предмет с ID «<ID босса>_summon» позволит призвать босса в игре "
+            "и не даст призвать второго, пока первый жив."
+        )
 
-        self.rarity = QComboBox()
-        self.rarity.addItems([
-            "Обычная",
-            "Необычная",
-            "Редкая",
-            "Очень редкая",
-            "Эпическая",
-            "Легендарная"
-        ])
+        self.summon_recipe_enabled = QCheckBox("Добавить рецепт призыва")
+        self.summon_recipe_enabled.setToolTip(
+            "TMC допишет рецепт в класс предмета-призыва: ингредиент, "
+            "количество и станция."
+        )
 
-        self.stack = QSpinBox()
-        self.stack.setRange(1, 9999)
-        self.stack.setValue(1)
+        self.summon_recipe_item = QComboBox()
 
-        self.price = QSpinBox()
-        self.price.setRange(0, 2_000_000_000)
+        for label, code in BOSS_RECIPE_INGREDIENTS:
+            self.summon_recipe_item.addItem(label, code)
+
+        self.summon_recipe_count = QSpinBox()
+        self.summon_recipe_count.setRange(1, 999)
+        self.summon_recipe_count.setValue(
+            DEFAULT_SUMMON_RECIPE["count"]
+        )
+
+        self.summon_recipe_station = QComboBox()
+
+        for label, code in BOSS_RECIPE_STATIONS:
+            self.summon_recipe_station.addItem(label, code)
+
+        self.music = QComboBox()
+
+        for label, code in BOSS_MUSIC_OPTIONS:
+            self.music.addItem(label, code)
 
         form.addRow("Название", self.name)
         form.addRow("Внутренний ID", self.internal_id)
         form.addRow("Описание", self.description)
-        form.addRow("Категория", self.category)
-        form.addRow("Редкость", self.rarity)
-        form.addRow("Максимальный стак", self.stack)
-        form.addRow("Цена (медные монеты)", self.price)
+        form.addRow("При экспорте", self.summon_enabled)
+        form.addRow("Рецепт", self.summon_recipe_enabled)
+        form.addRow("Ингредиент", self.summon_recipe_item)
+        form.addRow("Количество", self.summon_recipe_count)
+        form.addRow("Станция", self.summon_recipe_station)
+        form.addRow("Музыка", self.music)
 
-        coin_display = QWidget()
-        coin_display.setLayout(self.build_coin_display())
-
-        form.addRow("Разложение стоимости", coin_display)
-
-        self.price.valueChanged.connect(
-            self.update_coin_display
+        recipe_note = QLabel(
+            "Рецепт необязателен: без него предмет-призыв существует, но "
+            "получить его в игре можно только дропом или своим рецептом."
         )
+        recipe_note.setObjectName("hint")
+        recipe_note.setWordWrap(True)
+        form.addRow(recipe_note)
 
-        self.update_coin_display()
-
-        self.tabs.addTab(tab, "Свойства")
-
-    def apply_resource_to_item(self, relative_path):
-
-        if self.current_key is None:
-            QMessageBox.warning(
-                self,
-                "Нет предмета",
-                "Сначала создай или выбери предмет."
-            )
-            return
-
-        if not self.save_current_item():
-            return
-
-        path = self.project_path / relative_path
-
-        image = QImage(str(path))
-
-        if image.isNull():
-            QMessageBox.warning(
-                self,
-                "Ошибка изображения",
-                "Не удалось загрузить выбранный ресурс."
-            )
-            return
-
-        self.canvas.set_image(image)
-
-        self.canvas_width.setValue(image.width())
-        self.canvas_height.setValue(image.height())
-
-        self.inventory_preview.set_item_image(image)
-
-        self.items[self.current_key]["sprite"] = image.copy()
-
-        self.items[self.current_key]["data"][
-            "sprite_resource"
-        ] = relative_path
-
-        self.statusBar().showMessage(
-            f"Назначено изображение: {path.name}"
+        self.summon_enabled.toggled.connect(self.update_summon_fields)
+        self.summon_recipe_enabled.toggled.connect(
+            self.update_summon_fields
         )
+        self.update_summon_fields()
 
-        self.tabs.setCurrentIndex(2)
-    # ========================================================
-    # SPRITE TAB
-    # ========================================================
-
-    
-    def build_sprite_tab(self):
-
-        tab = QWidget()
-        layout = QHBoxLayout(tab)
-
-        # ========================================================
-        # LEFT: CANVAS
-        # ========================================================
-
-        left = QVBoxLayout()
-
-        left.addWidget(section_label("Пиксельный редактор"))
-
-        self.canvas = PixelCanvas()
-
-        left.addWidget(self.canvas, 1)
-
-        # Инструменты рисования
-        tools = QHBoxLayout()
-
-        color_btn = QPushButton("Выбрать цвет")
-        color_btn.clicked.connect(
-            self.canvas.choose_color
+        note = QLabel(
+            "Если не выбирать музыку, tModLoader использует обычную "
+            "боевую тему. Ванильные темы подставляются без музыканта "
+            "в моде."
         )
-
-        self.eraser_btn = QPushButton("Ластик: выкл.")
-        self.eraser_btn.setCheckable(True)
-        self.eraser_btn.toggled.connect(
-            self.toggle_eraser
-        )
-        self.fill_btn = QPushButton("Ведро: выкл.")
-        self.fill_btn.setCheckable(True)
-        self.fill_btn.toggled.connect(
-            self.toggle_fill
-        )
-
-        clear_btn = QPushButton("Очистить")
-        clear_btn.clicked.connect(
-            self.canvas.clear
-        )
-
-        undo_btn = QPushButton("↶")
-        undo_btn.setToolTip("Отменить действие")
-        undo_btn.clicked.connect(
-            self.canvas.undo
-        )
-
-        redo_btn = QPushButton("↷")
-        redo_btn.setToolTip("Повторить действие")
-        redo_btn.clicked.connect(
-            self.canvas.redo
-        )
-
-        tools.addWidget(color_btn)
-        tools.addWidget(self.eraser_btn)
-        tools.addWidget(self.fill_btn)
-        tools.addWidget(undo_btn)
-        tools.addWidget(redo_btn)
-        tools.addWidget(clear_btn)
-
-        left.addLayout(tools)
-
-        layout.addLayout(left, 3)
-
-        # ========================================================
-        # RIGHT: SETTINGS
-        # ========================================================
-
-        right = QVBoxLayout()
-
-        right.addWidget(section_label("Холст"))
-
-        right.addWidget(QLabel("Ширина"))
-
-        self.canvas_width = QSpinBox()
-        self.canvas_width.setRange(1, 512)
-        self.canvas_width.setValue(32)
-
-        right.addWidget(self.canvas_width)
-
-        right.addWidget(QLabel("Высота"))
-
-        self.canvas_height = QSpinBox()
-        self.canvas_height.setRange(1, 512)
-        self.canvas_height.setValue(32)
-
-        right.addWidget(self.canvas_height)
-
-        resize_btn = QPushButton("Изменить размер холста")
-        resize_btn.clicked.connect(
-            self.resize_sprite_canvas
-        )
-
-        new_canvas_btn = QPushButton("Создать новый холст")
-        new_canvas_btn.clicked.connect(
-            self.create_sprite_canvas
-        )
-
-        right.addWidget(resize_btn)
-        right.addWidget(new_canvas_btn)
-
-        right.addSpacing(15)
-
-        # Масштаб
-        right.addWidget(section_label("Масштаб просмотра"))
-
-        self.canvas_zoom = QSpinBox()
-        self.canvas_zoom.setRange(2, 32)
-        self.canvas_zoom.setValue(12)
-        self.canvas_zoom.setSuffix(" px")
-
-        self.canvas_zoom.valueChanged.connect(
-            self.canvas.set_zoom
-        )
-
-        right.addWidget(self.canvas_zoom)
-
-        right.addSpacing(15)
-
-        # PNG
-        right.addWidget(section_label("Изображение"))
-
-        import_btn = QPushButton("Импорт PNG")
-        import_btn.clicked.connect(self.import_png)
-
-        export_btn = QPushButton("Экспорт PNG")
-        export_btn.clicked.connect(self.export_png)
-
-        right.addWidget(import_btn)
-        right.addWidget(export_btn)
-
-        right.addStretch()
-
-        layout.addLayout(right, 1)
-
-        self.tabs.addTab(tab, "Спрайт")
-    
-    def toggle_eraser(self, enabled):
-        self.canvas.set_eraser(enabled)
-
-        if enabled:
-            self.fill_btn.setChecked(False)
-
-        self.eraser_btn.setText(
-            "Ластик: вкл." if enabled else "Ластик: выкл."
-        )
-
-
-    def toggle_fill(self, enabled):
-        self.canvas.set_fill_tool(enabled)
-
-        if enabled:
-            self.eraser_btn.setChecked(False)
-
-        self.fill_btn.setText(
-            "Ведро: вкл." if enabled else "Ведро: выкл."
-        )
-
-
-    def resize_sprite_canvas(self):
-        width = self.canvas_width.value()
-        height = self.canvas_height.value()
-
-        self.canvas.resize_canvas(width, height)
-
-        self.statusBar().showMessage(
-            f"Размер холста: {width} × {height}"
-        )
-
-
-    def create_sprite_canvas(self):
-        answer = QMessageBox.question(
-            self,
-            "Новый холст",
-            "Создать новый пустой холст? "
-            "Текущий рисунок будет заменён.",
-            QMessageBox.StandardButton.Yes |
-            QMessageBox.StandardButton.No
-        )
-
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-
-        width = self.canvas_width.value()
-        height = self.canvas_height.value()
-
-        self.canvas.new_canvas(width, height)
-
-        self.statusBar().showMessage(
-            f"Создан холст: {width} × {height}"
-        )
-
-
-    # ========================================================
-    # OBJECT STORAGE
-    # ========================================================
-
-    def get_object_collection(self, object_type):
-        """Возвращает коллекцию объектов указанного типа."""
-
-        if object_type not in self.objects:
-            raise ValueError(
-                f"Неизвестный тип объекта: {object_type}"
-            )
-
-        return self.objects[object_type]
-
-    # ========================================================
-    # ITEM DATA
-    # ========================================================
-
-    def default_item(self, item_id):
-        return {
-            "schema_version": 1,
-            "kind": "item",
-            "name": "Новый предмет",
-            "internal_id": item_id,
-            "description": "",
-            "category": "Материал",
-            "rarity": "Обычная",
-            "max_stack": 1,
-            "price_copper": 0,
-            "combat": {
-            "damage": 0,
-            "knockback": 0.0,
-            "use_time": 20,
-            "use_animation": 20,
-            "crit": 4,
-            "mana": 0,
-            "shoot_speed": 0.0,
-            "auto_reuse": False,
-            "damage_type": "Melee"
-            },
-            "sprite_resource": None
-        }
-
-    def create_default_item(self):
-
-        self.items.clear()
-        self.items["new_item"] = {
-            "data": self.default_item("new_item"),
-            "sprite": QImage(
-                32, 32, QImage.Format_ARGB32
-            ),
-            "animation": {
-                "frames": [],
-                "loop": True
-            }
-        }
-
-        self.items["new_item"]["sprite"].fill(
-            Qt.GlobalColor.transparent
-        )
-
-        self.current_keys["items"] = "new_item"
-        self.refresh_item_list()
-        self.select_item("new_item")
-
-    # ========================================================
-    # ITEM LIST
-    # ========================================================
-
-    def refresh_item_list(self, selected_key=None):
-
-        self.object_list.blockSignals(True)
-        self.object_list.clear()
-
-        collection = self.objects[self.current_object_type]
-        keys = list(collection.keys())
-
-        for key in keys:
-            obj = collection[key]
-            data = obj.get("data", {})
-
-            item = QListWidgetItem(
-                data.get("name", key)
-            )
-            item.setData(Qt.ItemDataRole.UserRole, key)
-
-            sprite = obj.get("sprite")
-
-            if isinstance(sprite, QImage) and not sprite.isNull():
-                item.setIcon(QIcon(
-                    QPixmap.fromImage(sprite).scaled(
-                        28, 28,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.FastTransformation
-                    )
-                ))
-
-            if self.current_object_type == "items":
-                rarity_color = RARITY_COLORS.get(data.get("rarity"))
-
-                if rarity_color:
-                    item.setForeground(QColor(rarity_color))
-
-            self.object_list.addItem(item)
-
-        if selected_key in keys:
-            self.object_list.setCurrentRow(keys.index(selected_key))
-
-        self.object_list.blockSignals(False)
-        self.refresh_item_card()
-        has_objects = bool(collection)
-        self.duplicate_object_btn.setEnabled(has_objects)
-        self.delete_object_btn.setEnabled(has_objects)
-
-    def change_object_type(self, index):
-        """Переключает категорию объектов, сохраняя текущие изменения."""
-
-        if index < 0 or index >= len(self.OBJECT_TYPES):
-            return
-
-        previous_type = self.current_object_type
-
-        if previous_type == "items":
-            if not self.save_current_item():
-                self.content_type.blockSignals(True)
-                self.content_type.setCurrentIndex(
-                    self.OBJECT_TYPES.index(previous_type)
-                )
-                self.content_type.blockSignals(False)
-                return
-
-        self.current_keys[previous_type] = self.current_key
-
-        object_type = self.OBJECT_TYPES[index]
-        self.current_object_type = object_type
-        self.current_key = self.current_keys.get(object_type)
-
-        is_item_editor = object_type == "items"
-        self.editor_panel.setEnabled(is_item_editor)
-
-        self.add_object_btn.setText(
-            f"+ Создать {self.OBJECT_LABELS[object_type]}"
-        )
-        self.duplicate_object_btn.setEnabled(
-            bool(self.get_object_collection(object_type))
-        )
-        self.delete_object_btn.setEnabled(
-            bool(self.get_object_collection(object_type))
-        )
-
-        if is_item_editor:
-            self.category_hint.setText(
-                "Редактор предметов доступен полностью."
-            )
-            self.refresh_item_list(self.current_key)
-
-            if self.current_key in self.items:
-                self.select_item(self.current_key)
-            else:
-                self.current_key = None
-                self.current_keys[object_type] = None
-        else:
-            self.refresh_item_list(self.current_key)
-            if self.current_key in self.objects[object_type]:
-                self.select_generic_object(self.current_key)
-            else:
-                self.current_key = None
-                self.current_keys[object_type] = None
-                self.category_hint.setText(
-                    f"В категории «{self.category_names[object_type]}» "
-                    "пока нет объектов. Нажми «Создать», чтобы добавить первый. "
-                    "Двойной щелчок по объекту открывает его основные свойства."
-                )
-
-        self.statusBar().showMessage(
-            f"Категория: {self.category_names[object_type]}"
-        )
-
-    def select_generic_object(self, key):
-        """Выбирает объект категории, для которой ещё нет отдельного редактора."""
-
-        collection = self.get_object_collection(self.current_object_type)
-        if key not in collection or self.current_object_type == "items":
-            return
-
-        self.current_key = key
-        self.current_keys[self.current_object_type] = key
-        data = collection[key].get("data", {})
-
-        self.category_hint.setText(
-            f"{data.get('name', key)}\n"
-            f"ID: {data.get('internal_id', key)}\n\n"
-            f"{data.get('description') or 'Описание не добавлено.'}\n\n"
-            "Двойной щелчок по объекту — изменить название и описание."
-        )
-
-        self.duplicate_object_btn.setEnabled(True)
-        self.delete_object_btn.setEnabled(True)
-
-    def create_generic_object(self):
-        """Создаёт базовую запись для не-предметных категорий."""
-
-        object_type = self.current_object_type
-        collection = self.get_object_collection(object_type)
-
-        number = 1
-        while f"new_{object_type}_{number}" in collection:
-            number += 1
-
-        object_id = f"new_{object_type}_{number}"
-        display_name, accepted = QInputDialog.getText(
-            self,
-            f"Создать: {self.category_names[object_type]}",
-            "Название объекта:",
-            text=f"Новый {self.OBJECT_LABELS[object_type]}"
-        )
-
-        if not accepted or not display_name.strip():
-            return
-
-        sprite = QImage(32, 32, QImage.Format_ARGB32)
-        sprite.fill(Qt.GlobalColor.transparent)
-
-        collection[object_id] = {
-            "data": {
-                "schema_version": 1,
-                "kind": self.OBJECT_KINDS[object_type],
-                "name": display_name.strip(),
-                "internal_id": object_id,
-                "description": ""
-            },
-            "sprite": sprite,
-            "animation": {"frames": [], "loop": True}
-        }
-
-        self.current_keys[object_type] = object_id
-        self.current_key = object_id
-        self.refresh_item_list(object_id)
-        self.select_generic_object(object_id)
-        self.statusBar().showMessage(f"Создан объект: {object_id}")
-
-    def edit_generic_object(self, item):
-        """Простое редактирование имени и описания базового объекта."""
-
-        if self.current_object_type == "items" or item is None:
-            return
-
-        key = item.data(Qt.ItemDataRole.UserRole)
-        collection = self.get_object_collection(self.current_object_type)
-        if key not in collection:
-            return
-
-        data = collection[key]["data"]
-        name, accepted = QInputDialog.getText(
-            self,
-            "Свойства объекта",
-            "Название:",
-            text=data.get("name", key)
-        )
-        if not accepted or not name.strip():
-            return
-
-        description, accepted = QInputDialog.getMultiLineText(
-            self,
-            "Свойства объекта",
-            "Описание:",
-            data.get("description", "")
-        )
-        if not accepted:
-            return
-
-        data["name"] = name.strip()
-        data["description"] = description.strip()
-        self.select_generic_object(key)
-        self.refresh_item_list(key)
-        self.statusBar().showMessage(f"Изменён объект: {key}")
-
-    def select_item(self, key):
-
-        if key not in self.items:
-            return
-
-        self.current_key = key
-        self.current_keys["items"] = key
-
-        data = self.items[key]["data"]
-        sprite = self.items[key]["sprite"]
-
-        self.loading_item = True
-
-        self.name.setText(data.get("name", ""))
-        self.internal_id.setText(
-            data.get("internal_id", key)
-        )
-        self.description.setText(
-            data.get("description", "")
-        )
-
-        self.category.setCurrentText(
-            data.get("category", "Материал")
-        )
-
-        self.rarity.setCurrentText(
-            data.get("rarity", "Обычная")
-        )
-
-        self.stack.setValue(
-            int(data.get("max_stack", 1))
-        )
-
-        self.price.setValue(
-            int(data.get("price_copper", 0))
-        )
-        combat = data.get("combat", {})
-
-        self.damage.setValue(combat.get("damage", 0))
-        self.knockback.setValue(combat.get("knockback", 0.0))
-        self.use_time.setValue(combat.get("use_time", 20))
-        self.use_animation.setValue(combat.get("use_animation", 20))
-        self.crit.setValue(combat.get("crit", 4))
-        self.mana.setValue(combat.get("mana", 0))
-        self.shoot_speed.setValue(combat.get("shoot_speed", 0.0))
-        self.auto_reuse.setChecked(combat.get("auto_reuse", False))
-        self.damage_type.setCurrentText(combat.get("damage_type", "Melee"))
-
-        self.canvas.set_image(sprite)
-
-        self.canvas_width.setValue(sprite.width())
-        self.canvas_height.setValue(sprite.height())
-
-        self.inventory_preview.set_item_image(sprite)
-
-        self.animation_editor.set_animation(
-            self.items[key].get(
-                "animation",
-                {"frames": [], "loop": True}
-            )
-        )
-
-        self.loading_item = False
-
-        self.refresh_item_list(key)
-
-    def on_item_selected(self, row):
-
-        if row < 0:
-            return
-
-        item = self.object_list.item(row)
-        if item is None:
-            return
-
-        key = item.data(Qt.ItemDataRole.UserRole)
-        if not key:
-            return
-
-        if self.current_object_type == "items":
-            if not self.save_current_item():
-                self.refresh_item_list(self.current_key)
-                return
-            self.select_item(key)
-        else:
-            self.select_generic_object(key)
-
-    # ========================================================
-    # SAVE CURRENT ITEM INTO MEMORY
-    # ========================================================
-
-    def save_current_item(self):
-
-        if self.current_object_type != "items":
-            return True
-
-        if self.loading_item:
-            return True
-
-        if self.current_key is None:
-            return True
-
-        if self.current_key not in self.items:
-            return True
-
-        new_id = self.internal_id.text().strip()
-
-        if not self.is_valid_id(new_id):
-            QMessageBox.warning(
-                self,
-                "Некорректный ID",
-                "ID должен начинаться с латинской буквы "
-                "и содержать только латинские буквы, "
-                "цифры и нижнее подчёркивание."
-            )
-            return False
-
-        if any(
-            key != self.current_key and key.lower() == new_id.lower()
-            for key in self.items
-        ):
-            QMessageBox.warning(
-                self,
-                "ID занят",
-                "Предмет с таким ID уже существует."
-            )
-            return False
-
-
-        old_key = self.current_key
-
-        old_data = self.items[old_key]["data"]
-
-        sprite_resource = old_data.get(
-            "sprite_resource",
-            old_data.get("combat", {}).get("sprite_resource")
-        )
-
-        # Сначала получаем изображения и анимацию
-        sprite = self.canvas.get_image()
-        animation = self.animation_editor.get_animation()
-
-        self.inventory_preview.set_item_image(sprite)
-
-        # Теперь создаём данные предмета
-        data = {
-            "schema_version": 1,
-            "kind": "item",
-            "name": self.name.text(),
-            "internal_id": new_id,
-            "description": self.description.text(),
-            "category": self.category.currentText(),
-            "rarity": self.rarity.currentText(),
-            "max_stack": self.stack.value(),
-            "price_copper": self.price.value(),
-
-            "sprite_resource": sprite_resource,
-
-            "combat": {
-                "damage": self.damage.value(),
-                "knockback": self.knockback.value(),
-                "use_time": self.use_time.value(),
-                "use_animation": self.use_animation.value(),
-                "crit": self.crit.value(),
-                "mana": self.mana.value(),
-                "shoot_speed": self.shoot_speed.value(),
-                "auto_reuse": self.auto_reuse.isChecked(),
-                "damage_type": self.damage_type.currentText()
-            },
-
-            "animation": {
-                "loop": animation["loop"],
-                "frames": []
-            }
-        }
-
-        self.items[old_key] = {
-            "data": data,
-            "sprite": sprite,
-            "animation": animation
-        }
-
-        if new_id != old_key:
-            self.items[new_id] = self.items.pop(old_key)
-            self.current_key = new_id
-
-        self.refresh_item_list(self.current_key)
-
-        return True
-
-
-    # ========================================================
-    # CREATE / DUPLICATE / DELETE
-    # ========================================================
-
-    def add_item(self):
-
-        if self.current_object_type != "items":
-            self.create_generic_object()
-            return
-
-        if not self.save_current_item():
-            return
-
-        number = 1
-        while f"new_item_{number}" in self.items:
-            number += 1
-
-        item_id = f"new_item_{number}"
-        sprite = QImage(32, 32, QImage.Format_ARGB32)
-        sprite.fill(Qt.GlobalColor.transparent)
-
-        self.items[item_id] = {
-            "data": self.default_item(item_id),
-            "sprite": sprite,
-            "animation": {"frames": [], "loop": True}
-        }
-
-        self.current_keys["items"] = item_id
-        self.refresh_item_list(item_id)
-        self.select_item(item_id)
-        self.statusBar().showMessage(f"Создан предмет: {item_id}")
-
-    def duplicate_item(self):
-
-        object_type = self.current_object_type
-        collection = self.get_object_collection(object_type)
-        if self.current_key is None or self.current_key not in collection:
-            return
-
-        if object_type == "items" and not self.save_current_item():
-            return
-
-        original = collection[self.current_key]
-        number = 1
-        while f"copy_{number}" in collection:
-            number += 1
-        new_id = f"copy_{number}"
-
-        new_data = copy.deepcopy(original["data"])
-        new_data["name"] = f"{new_data.get('name', 'Объект')} (копия)"
-        new_data["internal_id"] = new_id
-
-        original_animation = original.get(
-            "animation", {"frames": [], "loop": True}
-        )
-        new_animation = {
-            "frames": [
-                {
-                    "image": frame["image"].copy(),
-                    "duration_ms": frame["duration_ms"]
-                }
-                for frame in original_animation.get("frames", [])
-            ],
-            "loop": original_animation.get("loop", True)
-        }
-
-        collection[new_id] = {
-            "data": new_data,
-            "sprite": original["sprite"].copy(),
-            "animation": new_animation
-        }
-
-        self.current_keys[object_type] = new_id
-        self.refresh_item_list(new_id)
-        if object_type == "items":
-            self.select_item(new_id)
-        else:
-            self.select_generic_object(new_id)
-
-        self.statusBar().showMessage(f"Создана копия: {new_id}")
-
-    def delete_item(self):
-
-        object_type = self.current_object_type
-        collection = self.get_object_collection(object_type)
-        if self.current_key is None or self.current_key not in collection:
-            return
-
-        data = collection[self.current_key].get("data", {})
-        display_name = data.get("name", self.current_key)
-        label = self.category_names[object_type].lower()
-
-        answer = QMessageBox.question(
-            self,
-            f"Удаление: {label}",
-            f"Удалить «{display_name}»?",
-            QMessageBox.StandardButton.Yes |
-            QMessageBox.StandardButton.No
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-
-        deleted = self.current_key
-        del collection[deleted]
-        self.current_key = None
-        self.current_keys[object_type] = None
-
-        if collection:
-            next_key = next(iter(collection))
-            self.refresh_item_list(next_key)
-            if object_type == "items":
-                self.select_item(next_key)
-            else:
-                self.select_generic_object(next_key)
-        else:
-            self.refresh_item_list()
-            self.duplicate_object_btn.setEnabled(False)
-            self.delete_object_btn.setEnabled(False)
-
-            if object_type == "items":
-                self.name.clear()
-                self.internal_id.clear()
-                self.description.clear()
-                self.canvas.clear()
-                self.animation_editor.set_animation({
-                    "frames": [], "loop": True
-                })
-            else:
-                self.category_hint.setText(
-                    f"Категория «{self.category_names[object_type]}» пуста. "
-                    "Нажми «Создать», чтобы добавить объект."
-                )
-
-        self.statusBar().showMessage(f"Удалён объект: {deleted}")
-
-    # ========================================================
-    # PROJECT SYSTEM
-    # ========================================================
-
-    def create_project_structure(self, root):
-
-        folders = [
-            "Content/Items",
-            "Content/Accessories",
-            "Content/NPCs",
-            "Content/Mobs",
-            "Content/Bosses",
-            "Assets/Items",
-            "Assets/Accessories",
-            "Assets/NPCs",
-            "Assets/Mobs",
-            "Assets/Bosses",
-            "Assets/Animations",
-            "Assets/Resources/Images",
-            "Assets/Resources/Sounds",
-            "Export"
-        ]
-
-        for folder in folders:
-            (root / folder).mkdir(
-                parents=True,
-                exist_ok=True
-            )
-
-
-    def new_project(self):
-
-        project_name, ok = QInputDialog.getText(
-            self,
-            "Новый проект",
-            "Название проекта:",
-            text="MyTerrariaMod"
-        )
-
-        if not ok or not project_name.strip():
-            return
-
-        parent = QFileDialog.getExistingDirectory(
-            self,
-            "Выбери папку для проекта"
-        )
-
-        if not parent:
-            return
-
-        root = Path(parent) / project_name.strip()
-
-        if root.exists() and any(root.iterdir()):
-            QMessageBox.warning(
-                self,
-                "Папка занята",
-                "Выбранная папка уже существует и не пуста."
-            )
-            return
-
-        root.mkdir(parents=True, exist_ok=True)
-
-        self.project_path = root
-        self.reset_generator_output()
-        self.resource_manager.set_project(root)
-
-        for object_type in self.OBJECT_TYPES:
-            self.objects[object_type].clear()
-            self.current_keys[object_type] = None
-
-        self.current_object_type = "items"
-        self.current_key = None
-        self.content_type.blockSignals(True)
-        self.content_type.setCurrentIndex(0)
-        self.content_type.blockSignals(False)
-        self.editor_panel.setEnabled(True)
-        self.add_object_btn.setText("+ Создать предмет")
-
-        self.create_default_item()
-        self.save_project()
-
-        self.statusBar().showMessage(
-            f"Создан проект: {root}"
-        )
-
-    def save_project(self):
-
-        if not self.save_current_item():
-            return False
-
-        if self.project_path is None:
-            return self.save_project_as()
-
-        try:
-            root = self.project_path
-            self.trash_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-            self.create_project_structure(root)
-
-            item_ids = list(self.items.keys())
-
-            # Сохраняем каждый предмет
-            # Сохраняем каждый предмет и его анимацию
-            for item_id, obj in self.items.items():
-
-                data_path = (
-                    root / "Content" / "Items"
-                    / f"{item_id}.json"
-                )
-
-                sprite_path = (
-                    root / "Assets" / "Items"
-                    / f"{item_id}.png"
-                )
-
-                animation = obj.get(
-                    "animation",
-                    {"frames": [], "loop": True}
-                )
-
-                animation_dir = (
-                    root / "Assets" / "Animations" / item_id
-                )
-
-                animation_dir.mkdir(
-                    parents=True,
-                    exist_ok=True
-                )
-
-                frame_metadata = []
-
-                for index, frame in enumerate(animation["frames"]):
-
-                    filename = f"frame_{index:03d}.png"
-                    frame_path = animation_dir / filename
-
-                    if not frame["image"].save(
-                        str(frame_path), "PNG"
-                    ):
-                        raise OSError(
-                            f"Не удалось сохранить кадр {filename}"
-                        )
-
-                    relative_frame_path = frame_path.relative_to(
-                        root
-                    ).as_posix()
-
-                    frame_metadata.append({
-                        "file": relative_frame_path,
-                        "duration_ms": frame["duration_ms"]
-                    })
-
-                # Удаляем старые кадры, которых больше нет
-                valid_names = {
-                    f"frame_{index:03d}.png"
-                    for index in range(len(animation["frames"]))
-                }
-
-                for old_frame in animation_dir.glob("*.png"):
-                    if old_frame.name not in valid_names:
-                        self.discard_path(root, old_frame)
-
-                # Метаданные анимации записываются в JSON
-                obj["data"]["animation"] = {
-                    "loop": animation["loop"],
-                    "frames": frame_metadata
-                }
-
-                if not obj["sprite"].save(
-                    str(sprite_path), "PNG"
-                ):
-                    raise OSError(
-                        f"Не удалось сохранить {sprite_path.name}"
-                    )
-
-                data_path.write_text(
-                    json.dumps(
-                        obj["data"],
-                        ensure_ascii=False,
-                        indent=2
-                    ),
-                    encoding="utf-8"
-                )
-
-            # Сохраняем остальные категории как базовые объекты.
-            # У них пока нет специализированных редакторов, поэтому сохраняются
-            # общие свойства и заготовка спрайта.
-            for object_type in self.OBJECT_TYPES:
-                if object_type == "items":
-                    continue
-
-                folder_name = self.CONTENT_FOLDERS[object_type]
-                content_dir = root / "Content" / folder_name
-                assets_dir = root / "Assets" / folder_name
-                content_dir.mkdir(parents=True, exist_ok=True)
-                assets_dir.mkdir(parents=True, exist_ok=True)
-
-                collection = self.objects[object_type]
-                valid_ids = set(collection.keys())
-
-                for object_id, obj in collection.items():
-                    data = obj.get("data", {})
-                    data["internal_id"] = object_id
-                    data_path = content_dir / f"{object_id}.json"
-                    sprite_path = assets_dir / f"{object_id}.png"
-
-                    data_path.write_text(
-                        json.dumps(data, ensure_ascii=False, indent=2),
-                        encoding="utf-8"
-                    )
-
-                    sprite = obj.get("sprite")
-                    if sprite is not None and not sprite.isNull():
-                        if not sprite.save(str(sprite_path), "PNG"):
-                            raise OSError(
-                                f"Не удалось сохранить спрайт {sprite_path.name}"
-                            )
-
-                for old_file in content_dir.glob("*.json"):
-                    if old_file.stem not in valid_ids:
-                        self.discard_path(root, old_file)
-                for old_file in assets_dir.glob("*.png"):
-                    if old_file.stem not in valid_ids:
-                        self.discard_path(root, old_file)
-
-            # Удаляем файлы предметов, которых больше нет
-            items_dir = root / "Content" / "Items"
-            assets_dir = root / "Assets" / "Items"
-
-            for file in items_dir.glob("*.json"):
-                if file.stem not in item_ids:
-                    self.discard_path(root, file)
-
-            for file in assets_dir.glob("*.png"):
-                if file.stem not in item_ids:
-                    self.discard_path(root, file)
-
-            # Удаляем папки анимаций предметов,
-            # которых больше нет в проекте
-            animations_dir = root / "Assets" / "Animations"
-
-            if animations_dir.exists():
-                for folder in animations_dir.iterdir():
-                    if folder.is_dir() and folder.name not in item_ids:
-                        self.discard_path(root, folder)
-            
-            
-            project_data = {
-                "format": "TMC",
-                "schema_version": 1,
-                "name": root.name,
-                "objects": {
-                    object_type: (
-                        list(self.objects[object_type].keys())
-                    )
-                    for object_type in self.OBJECT_TYPES
-                }
-            }
-
-            (root / "project.json").write_text(
-                json.dumps(
-                    project_data,
-                    ensure_ascii=False,
-                    indent=2
-                ),
-                encoding="utf-8"
-            )
-
-            self.project_label.setText(root.name)
-            self.resource_manager.refresh()
-
-            self.statusBar().showMessage(
-                f"Проект сохранён: {root}"
-            )
-            return True
-
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Ошибка сохранения",
-                str(exc)
-            )
-            return False
-
-    def save_project_as(self):
-
-        path = QFileDialog.getExistingDirectory(
-            self,
-            "Выбери папку проекта"
-        )
-
-        if not path:
-            return False
-
-        self.project_path = Path(path)
-        self.reset_generator_output()
-        return self.save_project()
-
-    def open_project(self):
-
-        path = QFileDialog.getExistingDirectory(
-            self,
-            "Выбери папку проекта"
-        )
-
-        if not path:
-            return
-
-        root = Path(path)
-        manifest = root / "project.json"
-
-        if not manifest.exists():
-            QMessageBox.warning(
-                self,
-                "Ошибка",
-                "В этой папке нет project.json."
-            )
-            return
-
-        try:
-            project_data = json.loads(
-                manifest.read_text(encoding="utf-8")
-            )
-
-            if project_data.get("format") != "TMC":
-                raise ValueError(
-                    "Это не проект Terraria Mod Creator."
-                )
-
-            loaded_items = {}
-
-            item_ids = project_data.get(
-                "objects", {}
-            ).get("items", [])
-
-            skipped = []
-            seen_ids = set()
-
-            for item_id in item_ids:
-
-                if (
-                    not self.is_valid_id(item_id)
-                    or item_id.lower() in seen_ids
-                ):
-                    skipped.append(f"Items/{item_id}")
-                    continue
-
-                seen_ids.add(item_id.lower())
-
-                data_path = (
-                    root / "Content" / "Items"
-                    / f"{item_id}.json"
-                )
-
-                sprite_path = (
-                    root / "Assets" / "Items"
-                    / f"{item_id}.png"
-                )
-
-                try:
-                    data = json.loads(
-                        data_path.read_text(encoding="utf-8")
-                    )
-                    if not isinstance(data, dict):
-                        raise ValueError("bad item data")
-                except (OSError, ValueError):
-                    skipped.append(f"Items/{item_id}")
-                    continue
-
-                sprite = QImage(
-                    str(sprite_path)
-                )
-
-                if sprite.isNull():
-                    sprite = QImage(
-                        32, 32, QImage.Format_ARGB32
-                    )
-                    sprite.fill(
-                        Qt.GlobalColor.transparent
-                    )
-
-                # Загружаем анимацию
-                animation_data = data.get("animation", {})
-                if not isinstance(animation_data, dict):
-                    animation_data = {}
-
-                animation_frames = []
-                frame_records = animation_data.get("frames", [])
-                if not isinstance(frame_records, list):
-                    frame_records = []
-
-                for frame_info in frame_records:
-                    if not isinstance(frame_info, dict):
-                        continue
-
-                    relative_file = frame_info.get("file")
-                    if not isinstance(relative_file, str) or not relative_file:
-                        continue
-
-                    # Не позволяем проектному JSON читать файлы за пределами проекта.
-                    frame_path = (root / relative_file).resolve()
-                    try:
-                        frame_path.relative_to(root.resolve())
-                    except ValueError:
-                        skipped.append(
-                            f"Animations/{item_id}: недопустимый путь кадра"
-                        )
-                        continue
-
-                    if not frame_path.is_file():
-                        continue
-
-                    frame_image = QImage(str(frame_path))
-                    if frame_image.isNull():
-                        continue
-
-                    try:
-                        duration_ms = int(frame_info.get("duration_ms", 100))
-                    except (TypeError, ValueError):
-                        duration_ms = 100
-
-                    animation_frames.append({
-                        "image": frame_image,
-                        "duration_ms": max(20, min(10000, duration_ms))
-                    })
-
-                loaded_items[item_id] = {
-                    "data": data,
-                    "sprite": sprite,
-                    "animation": {
-                        "frames": animation_frames,
-                        "loop": animation_data.get("loop", True)
-                    }
-                }
-
-            loaded_objects = {"items": loaded_items}
-
-            # Загружаем общие объекты остальных категорий.
-            # Если в старом project.json категории отсутствуют, они останутся пустыми.
-            for object_type in self.OBJECT_TYPES:
-                if object_type == "items":
-                    continue
-
-                folder_name = self.CONTENT_FOLDERS[object_type]
-                category_ids = project_data.get("objects", {}).get(
-                    object_type, []
-                )
-                category_objects = {}
-
-                seen_category_ids = set()
-
-                for object_id in category_ids:
-                    if (
-                        not self.is_valid_id(object_id)
-                        or object_id.lower() in seen_category_ids
-                    ):
-                        skipped.append(f"{folder_name}/{object_id}")
-                        continue
-
-                    seen_category_ids.add(object_id.lower())
-
-                    data_path = (
-                        root / "Content" / folder_name / f"{object_id}.json"
-                    )
-                    sprite_path = (
-                        root / "Assets" / folder_name / f"{object_id}.png"
-                    )
-
-                    if not data_path.exists():
-                        continue
-
-                    try:
-                        data = json.loads(
-                            data_path.read_text(encoding="utf-8")
-                        )
-                        if not isinstance(data, dict):
-                            raise ValueError("bad object data")
-                    except (OSError, ValueError):
-                        skipped.append(f"{folder_name}/{object_id}")
-                        continue
-
-                    sprite = QImage(str(sprite_path))
-                    if sprite.isNull():
-                        sprite = QImage(32, 32, QImage.Format_ARGB32)
-                        sprite.fill(Qt.GlobalColor.transparent)
-
-                    category_objects[object_id] = {
-                        "data": data,
-                        "sprite": sprite,
-                        "animation": {"frames": [], "loop": True}
-                    }
-
-                loaded_objects[object_type] = category_objects
-
-            self.project_path = root
-            self.reset_generator_output()
-            self.resource_manager.set_project(root)
-
-            for object_type in self.OBJECT_TYPES:
-                collection = self.objects[object_type]
-                collection.clear()
-                collection.update(loaded_objects.get(object_type, {}))
-                self.current_keys[object_type] = None
-
-            # После открытия всегда возвращаемся к категории предметов.
-            self.current_object_type = "items"
-            self.current_key = None
-            self.content_type.blockSignals(True)
-            self.content_type.setCurrentIndex(0)
-            self.content_type.blockSignals(False)
-            self.editor_panel.setEnabled(True)
-            self.add_object_btn.setText("+ Создать предмет")
-
-            self.refresh_item_list()
-
-            if self.items:
-                first_key = next(iter(self.items))
-                self.current_keys["items"] = first_key
-                self.select_item(first_key)
-            else:
-                self.name.clear()
-                self.internal_id.clear()
-                self.description.clear()
-                self.canvas.clear()
-                self.animation_editor.set_animation({
-                    "frames": [], "loop": True
-                })
-
-            self.project_label.setText(root.name)
-
-            self.statusBar().showMessage(
-                f"Открыт проект: {root}"
-            )
-
-            if skipped:
-                QMessageBox.warning(
-                    self,
-                    "Часть объектов не загружена",
-                    "Эти объекты пропущены (нет файла, он повреждён "
-                    "или ID некорректен):\n\n"
-                    + "\n".join(skipped[:20])
-                    + (f"\n…и ещё {len(skipped) - 20}"
-                       if len(skipped) > 20 else "")
-                    + "\n\nПри сохранении они будут убраны из project.json."
-                )
-
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Ошибка открытия",
-                str(exc)
-            )
-
-    # ========================================================
-    # PNG IMPORT / EXPORT
-    # ========================================================
-
-    def import_png(self):
-
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Импорт PNG",
-            "",
-            "PNG (*.png)"
-        )
-
-        if not path:
-            return
-
-        try:
-            self.canvas.import_png(path)
-
-            self.canvas_width.setValue(
-                self.canvas.image.width()
-            )
-
-            self.canvas_height.setValue(
-                self.canvas.image.height()
-            )
-
-            self.inventory_preview.set_item_image(
-                self.canvas.get_image()
-            )
-
-            self.statusBar().showMessage(
-                "Изображение импортировано."
-            )
-
-        except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "Ошибка PNG",
-                str(exc)
-            )
-
-    def export_png(self):
-
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Экспорт PNG",
-            "sprite.png",
-            "PNG (*.png)"
-        )
-
-        if not path:
-            return
-
-        try:
-            self.canvas.export_png(path)
-
-        except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "Ошибка PNG",
-                str(exc)
-            )
-    
-    def build_coin_display(self):
-        """Создаёт отображение стоимости в четырёх номиналах."""
-
-        self.coin_amount_labels = {}
-
-        layout = QHBoxLayout()
-        layout.setContentsMargins(0, 5, 0, 5)
-        layout.setSpacing(12)
-
-        coins = [
-            ("PlatinumCoin", "Платина"),
-            ("GoldenCoin", "Золото"),
-            ("SilverCoin", "Серебро"),
-            ("CopperCoin", "Медь")
-        ]
-
-        self.coin_values = {
-            "PlatinumCoin": 1_000_000,
-            "GoldenCoin": 10_000,
-            "SilverCoin": 100,
-            "CopperCoin": 1
-        }
-
-        images_dir = (
-            Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-            / "images" / "coins"
-        )
-
-        for coin_id, coin_name in coins:
-            coin_widget = QWidget()
-            coin_layout = QHBoxLayout(coin_widget)
-            coin_layout.setContentsMargins(0, 0, 0, 0)
-            coin_layout.setSpacing(4)
-
-            icon = QLabel()
-            icon.setFixedSize(24, 24)
-            icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-            # Поддержка нескольких форматов изображений
-            image_path = None
-
-            for extension in (".png", ".webp", ".jpg", ".jpeg"):
-                candidate = images_dir / f"{coin_id}{extension}"
-
-                if candidate.exists():
-                    image_path = candidate
-                    break
-
-            if image_path:
-                pixmap = QPixmap(str(image_path))
-
-                icon.setPixmap(
-                    pixmap.scaled(
-                        24, 24,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation
-                    )
-                )
-            else:
-                icon.setText(coin_name[:1])
-                icon.setToolTip(
-                    f"Не найден файл {coin_id}"
-                )
-
-            amount = QLabel("0")
-            amount.setStyleSheet(
-                "font-weight:600;color:#e8eaf0;"
-            )
-
-            self.coin_amount_labels[coin_id] = amount
-
-            coin_layout.addWidget(icon)
-            coin_layout.addWidget(amount)
-
-            layout.addWidget(coin_widget)
-
-        layout.addStretch()
-
-        return layout
-
-
-    def update_coin_display(self, copper_amount=None):
-        """Переводит медные монеты в остальные номиналы."""
-
-        if copper_amount is None:
-            copper_amount = self.price.value()
-
-        remaining = copper_amount
-
-        for coin_id, coin_value in self.coin_values.items():
-            amount = remaining // coin_value
-            remaining %= coin_value
-
-            self.coin_amount_labels[coin_id].setText(
-                str(amount)
-            )
-
-    def build_combat_tab(self):
-        tab, form = make_form_tab()
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        form.addRow(note)
+
+        form.addRow(section_label("ХАРАКТЕРИСТИКИ"))
+
+        self.life_max = QSpinBox()
+        self.life_max.setRange(1, 10_000_000)
+        self.life_max.setSingleStep(100)
+        self.life_max.setValue(DEFAULT_BOSS_STATS["life_max"])
 
         self.damage = QSpinBox()
-        self.damage.setRange(0, 100000)
+        self.damage.setRange(0, 100_000)
+        self.damage.setValue(DEFAULT_BOSS_STATS["damage"])
 
-        self.knockback = QDoubleSpinBox()
-        self.knockback.setRange(0, 10000)
-        self.knockback.setDecimals(2)
+        self.defense = QSpinBox()
+        self.defense.setRange(0, 10_000)
+        self.defense.setValue(DEFAULT_BOSS_STATS["defense"])
 
-        self.use_time = QSpinBox()
-        self.use_time.setRange(1, 100000)
-        self.use_time.setValue(20)
-
-        self.use_animation = QSpinBox()
-        self.use_animation.setRange(1, 100000)
-        self.use_animation.setValue(20)
-
-        self.crit = QSpinBox()
-        self.crit.setRange(0, 100)
-        self.crit.setValue(4)
-
-        self.mana = QSpinBox()
-        self.mana.setRange(0, 100000)
-
-        self.shoot_speed = QDoubleSpinBox()
-        self.shoot_speed.setRange(0, 10000)
-        self.shoot_speed.setDecimals(2)
-
-        self.auto_reuse = QCheckBox(
-            "Автоматическое повторное использование"
+        self.knockback_resist = QDoubleSpinBox()
+        self.knockback_resist.setRange(0.0, 1.0)
+        self.knockback_resist.setDecimals(2)
+        self.knockback_resist.setSingleStep(0.05)
+        self.knockback_resist.setValue(
+            DEFAULT_BOSS_STATS["knockback_resist"]
         )
 
-        self.damage_type = QComboBox()
-        self.damage_type.addItems([
-            "Melee",
-            "Ranged",
-            "Magic",
-            "Summon",
-            "Generic"
+        self.width = QSpinBox()
+        self.width.setRange(8, 1024)
+        self.width.setValue(DEFAULT_BOSS_STATS["width"])
+
+        self.height = QSpinBox()
+        self.height.setRange(8, 1024)
+        self.height.setValue(DEFAULT_BOSS_STATS["height"])
+
+        self.scale = QDoubleSpinBox()
+        self.scale.setRange(0.1, 10.0)
+        self.scale.setDecimals(2)
+        self.scale.setSingleStep(0.05)
+        self.scale.setValue(DEFAULT_BOSS_STATS["scale"])
+
+        self.value = QSpinBox()
+        self.value.setRange(0, 2_000_000_000)
+        self.value.setSingleStep(1000)
+        self.value.setValue(DEFAULT_BOSS_STATS["value_copper"])
+
+        form.addRow("Максимум здоровья", self.life_max)
+        form.addRow("Урон", self.damage)
+        form.addRow("Защита", self.defense)
+        form.addRow(
+            "Сопротивление отбрасыванию (0–1)", self.knockback_resist
+        )
+        form.addRow("Ширина хитбокса", self.width)
+        form.addRow("Высота хитбокса", self.height)
+        form.addRow("Визуальный масштаб", self.scale)
+        form.addRow("Награда (медные монеты)", self.value)
+
+        note = QLabel(
+            "Хитбокс и масштаб независимы: масштаб меняет только картинку. "
+            "Сопротивление 0 — босса нельзя оттолкнуть, 1 — как NPC."
+        )
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        form.addRow(note)
+
+        form.addRow(section_label("СЛОЖНОСТЬ"))
+
+        self.expert_life_percent = QSpinBox()
+        self.expert_life_percent.setRange(50, 1000)
+        self.expert_life_percent.setSingleStep(5)
+        self.expert_life_percent.setSuffix(" %")
+        self.expert_life_percent.setValue(
+            DEFAULT_BOSS_STATS["expert_life_percent"]
+        )
+
+        self.master_life_percent = QSpinBox()
+        self.master_life_percent.setRange(50, 1000)
+        self.master_life_percent.setSingleStep(5)
+        self.master_life_percent.setSuffix(" %")
+        self.master_life_percent.setValue(
+            DEFAULT_BOSS_STATS["master_life_percent"]
+        )
+
+        form.addRow("Здоровье в эксперте", self.expert_life_percent)
+        form.addRow("Здоровье в мастере", self.master_life_percent)
+
+        note = QLabel(
+            "100% — столько же здоровья, сколько в обычном мире. "
+            "Terraria обычно даёт боссам больше здоровья на высоких "
+            "сложностях: 100–200% — привычный диапазон."
+        )
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        form.addRow(note)
+
+        form.addRow(section_label("ПОВЕДЕНИЕ"))
+
+        self.ai = QComboBox()
+
+        for label, code in BOSS_AI_OPTIONS:
+            self.ai.addItem(label, code)
+
+        self.movement_speed = QDoubleSpinBox()
+        self.movement_speed.setRange(0.1, 30.0)
+        self.movement_speed.setDecimals(2)
+        self.movement_speed.setSingleStep(0.5)
+        self.movement_speed.setValue(
+            DEFAULT_BOSS_STATS["movement_speed"]
+        )
+
+        self.hover_height = QSpinBox()
+        self.hover_height.setRange(0, 3000)
+        self.hover_height.setSingleStep(10)
+        self.hover_height.setSuffix(" px")
+        self.hover_height.setValue(DEFAULT_BOSS_STATS["hover_height"])
+
+        self.jump_force = QDoubleSpinBox()
+        self.jump_force.setRange(1.0, 30.0)
+        self.jump_force.setDecimals(2)
+        self.jump_force.setSingleStep(0.5)
+        self.jump_force.setValue(DEFAULT_BOSS_STATS["jump_force"])
+
+        self.orbit_radius = QSpinBox()
+        self.orbit_radius.setRange(40, 1500)
+        self.orbit_radius.setSingleStep(10)
+        self.orbit_radius.setSuffix(" px")
+        self.orbit_radius.setValue(DEFAULT_BOSS_STATS["orbit_radius"])
+
+        self.orbit_speed = QDoubleSpinBox()
+        self.orbit_speed.setRange(0.1, 12.0)
+        self.orbit_speed.setDecimals(2)
+        self.orbit_speed.setSingleStep(0.1)
+        self.orbit_speed.setSuffix(" °/тик")
+        self.orbit_speed.setValue(DEFAULT_BOSS_STATS["orbit_speed"])
+
+        self.teleport_interval = QSpinBox()
+        self.teleport_interval.setRange(30, 36_000)
+        self.teleport_interval.setSingleStep(30)
+        self.teleport_interval.setSuffix(" тик.")
+        self.teleport_interval.setValue(
+            DEFAULT_BOSS_STATS["teleport_interval"]
+        )
+
+        self.teleport_range = QSpinBox()
+        self.teleport_range.setRange(60, 1200)
+        self.teleport_range.setSingleStep(20)
+        self.teleport_range.setSuffix(" px")
+        self.teleport_range.setValue(DEFAULT_BOSS_STATS["teleport_range"])
+
+        self.charge_speed = QDoubleSpinBox()
+        self.charge_speed.setRange(2.0, 40.0)
+        self.charge_speed.setDecimals(2)
+        self.charge_speed.setSingleStep(1.0)
+        self.charge_speed.setValue(DEFAULT_BOSS_STATS["charge_speed"])
+
+        self.charge_pause = QSpinBox()
+        self.charge_pause.setRange(10, 1200)
+        self.charge_pause.setSingleStep(10)
+        self.charge_pause.setSuffix(" тик.")
+        self.charge_pause.setValue(DEFAULT_BOSS_STATS["charge_pause"])
+
+        self.ai_label = QLabel()
+        self.ai_label.setObjectName("hint")
+        self.ai_label.setWordWrap(True)
+
+        form.addRow("Поведение", self.ai)
+        form.addRow("Скорость движения", self.movement_speed)
+        form.addRow("Высота парения", self.hover_height)
+        form.addRow("Сила прыжка", self.jump_force)
+        form.addRow("Радиус орбиты", self.orbit_radius)
+        form.addRow("Скорость орбиты", self.orbit_speed)
+        form.addRow("Интервал телепорта", self.teleport_interval)
+        form.addRow("Разброс телепорта", self.teleport_range)
+        form.addRow("Скорость броска", self.charge_speed)
+        form.addRow("Пауза между бросками", self.charge_pause)
+        form.addRow(self.ai_label)
+
+        note = QLabel(
+            "Скорость задаётся в пикселях за игровой тик: 6 — умеренно "
+            "быстрый босс, 10 и выше — очень резкий. Для прыжков скорость "
+            "задаёт разбег по земле, а сила прыжка — высоту отскока."
+        )
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        form.addRow(note)
+
+        self.ai.currentIndexChanged.connect(self.update_ai_fields)
+        self.update_ai_fields()
+
+        self.tabs.addTab(tab, "Основное")
+
+    def build_attacks_tab(self):
+        tab, form = make_scroll_form_tab(760)
+        self.attacks_form = form
+
+        self.dash_enabled = QCheckBox(
+            "Периодически делает рывок к игроку"
+        )
+        self.dash_enabled.setToolTip(
+            "Рывок включает анимацию состояния «Атака» и временно "
+            "подменяет обычное движение."
+        )
+
+        self.dash_interval = QSpinBox()
+        self.dash_interval.setRange(30, 36_000)
+        self.dash_interval.setSingleStep(30)
+        self.dash_interval.setSuffix(" тик.")
+        self.dash_interval.setValue(DEFAULT_DASH["interval_ticks"])
+
+        self.dash_speed = QDoubleSpinBox()
+        self.dash_speed.setRange(1.0, 60.0)
+        self.dash_speed.setDecimals(2)
+        self.dash_speed.setSingleStep(1.0)
+        self.dash_speed.setValue(DEFAULT_DASH["speed"])
+
+        self.dash_duration = QSpinBox()
+        self.dash_duration.setRange(5, 600)
+        self.dash_duration.setSingleStep(5)
+        self.dash_duration.setSuffix(" тик.")
+        self.dash_duration.setValue(DEFAULT_DASH["duration_ticks"])
+
+        self.dash_expert_only = QCheckBox("Только в эксперте и мастере")
+
+        form.addRow(section_label("РЫВОК"))
+        form.addRow(self.dash_enabled)
+        form.addRow("Интервал", self.dash_interval)
+        form.addRow("Скорость", self.dash_speed)
+        form.addRow("Длительность", self.dash_duration)
+        form.addRow(self.dash_expert_only)
+
+        self.shoot_enabled = QCheckBox(
+            "Периодически стреляет снарядами"
+        )
+        self.shoot_enabled.setToolTip(
+            "Снаряды летят по выбранному узору. Выстрел включает "
+            "анимацию состояния «Атака»."
+        )
+
+        self.shoot_interval = QSpinBox()
+        self.shoot_interval.setRange(30, 36_000)
+        self.shoot_interval.setSingleStep(30)
+        self.shoot_interval.setSuffix(" тик.")
+        self.shoot_interval.setValue(DEFAULT_SHOOT["interval_ticks"])
+
+        self.shoot_pattern = QComboBox()
+
+        for label, code in BOSS_SHOOT_PATTERNS:
+            self.shoot_pattern.addItem(label, code)
+
+        self.shoot_source = QComboBox()
+
+        for label, code in BOSS_SHOOT_SOURCES:
+            self.shoot_source.addItem(label, code)
+
+        self.shoot_projectile = QComboBox()
+
+        for label, code in BOSS_PROJECTILE_OPTIONS:
+            self.shoot_projectile.addItem(label, code)
+
+        self.shoot_color_button = QPushButton()
+        self.shoot_color_button.clicked.connect(self.choose_shoot_color)
+
+        self.shoot_radius = QSpinBox()
+        self.shoot_radius.setRange(4, 64)
+        self.shoot_radius.setSuffix(" px")
+        self.shoot_radius.setValue(DEFAULT_SHOOT["radius"])
+
+        self.shoot_homing = QDoubleSpinBox()
+        self.shoot_homing.setRange(0.0, 1.0)
+        self.shoot_homing.setDecimals(2)
+        self.shoot_homing.setSingleStep(0.02)
+        self.shoot_homing.setValue(DEFAULT_SHOOT["homing"])
+
+        self.shoot_pierce = QSpinBox()
+        self.shoot_pierce.setRange(1, 10)
+        self.shoot_pierce.setValue(DEFAULT_SHOOT["pierce"])
+
+        self.shoot_lifetime = QSpinBox()
+        self.shoot_lifetime.setRange(60, 1800)
+        self.shoot_lifetime.setSingleStep(30)
+        self.shoot_lifetime.setSuffix(" тик.")
+        self.shoot_lifetime.setValue(DEFAULT_SHOOT["lifetime_ticks"])
+
+        self.shoot_spiral_step = QDoubleSpinBox()
+        self.shoot_spiral_step.setRange(1.0, 90.0)
+        self.shoot_spiral_step.setDecimals(0)
+        self.shoot_spiral_step.setSingleStep(1.0)
+        self.shoot_spiral_step.setSuffix("°")
+        self.shoot_spiral_step.setValue(DEFAULT_SHOOT["spiral_step"])
+
+        self.shoot_damage = QSpinBox()
+        self.shoot_damage.setRange(0, 100_000)
+        self.shoot_damage.setValue(DEFAULT_SHOOT["damage"])
+
+        self.shoot_count = QSpinBox()
+        self.shoot_count.setRange(1, 20)
+        self.shoot_count.setValue(DEFAULT_SHOOT["count"])
+
+        self.shoot_spread = QDoubleSpinBox()
+        self.shoot_spread.setRange(0.0, 180.0)
+        self.shoot_spread.setDecimals(1)
+        self.shoot_spread.setSingleStep(2.0)
+        self.shoot_spread.setSuffix("°")
+        self.shoot_spread.setValue(DEFAULT_SHOOT["spread_degrees"])
+
+        self.shoot_speed = QDoubleSpinBox()
+        self.shoot_speed.setRange(1.0, 60.0)
+        self.shoot_speed.setDecimals(2)
+        self.shoot_speed.setSingleStep(1.0)
+        self.shoot_speed.setValue(DEFAULT_SHOOT["speed"])
+
+        self.shoot_expert_only = QCheckBox("Только в эксперте и мастере")
+
+        self.adds_enabled = QCheckBox(
+            "Периодически призывает мобов"
+        )
+        self.adds_enabled.setToolTip(
+            "Босс зовёт на помощь ванильных мобов. Призыв тоже включает "
+            "анимацию состояния «Атака»."
+        )
+
+        self.adds_interval = QSpinBox()
+        self.adds_interval.setRange(60, 36_000)
+        self.adds_interval.setSingleStep(30)
+        self.adds_interval.setSuffix(" тик.")
+        self.adds_interval.setValue(DEFAULT_ADD_ATTACK["interval_ticks"])
+
+        self.adds_npc = QComboBox()
+
+        for label, code in BOSS_SUMMON_NPC_OPTIONS:
+            self.adds_npc.addItem(label, code)
+
+        self.adds_count = QSpinBox()
+        self.adds_count.setRange(1, 10)
+        self.adds_count.setValue(DEFAULT_ADD_ATTACK["count"])
+
+        self.adds_expert_only = QCheckBox("Только в эксперте и мастере")
+
+        form.addRow(section_label("СНАРЯДЫ"))
+        form.addRow(self.shoot_enabled)
+        form.addRow("Интервал", self.shoot_interval)
+        form.addRow("Узор", self.shoot_pattern)
+        form.addRow("Источник", self.shoot_source)
+        form.addRow("Ванильный снаряд", self.shoot_projectile)
+        form.addRow("Цвет своего снаряда", self.shoot_color_button)
+        form.addRow("Радиус своего снаряда", self.shoot_radius)
+        form.addRow("Самонаведение (0–1)", self.shoot_homing)
+        form.addRow("Пробивание", self.shoot_pierce)
+        form.addRow("Время жизни", self.shoot_lifetime)
+        form.addRow("Шаг спирали", self.shoot_spiral_step)
+        form.addRow("Урон", self.shoot_damage)
+        form.addRow("Количество", self.shoot_count)
+        form.addRow("Разброс", self.shoot_spread)
+        form.addRow("Скорость", self.shoot_speed)
+        form.addRow(self.shoot_expert_only)
+
+        form.addRow(section_label("ПРИЗЫВ МОБОВ"))
+        form.addRow(self.adds_enabled)
+        form.addRow("Интервал", self.adds_interval)
+        form.addRow("Моб", self.adds_npc)
+        form.addRow("Количество за призыв", self.adds_count)
+        form.addRow(self.adds_expert_only)
+
+        self.adds_note = QLabel()
+        self.adds_note.setObjectName("hint")
+        self.adds_note.setWordWrap(True)
+        form.addRow(self.adds_note)
+
+        self.attack_note = QLabel()
+        self.attack_note.setObjectName("hint")
+        self.attack_note.setWordWrap(True)
+        form.addRow(self.attack_note)
+
+        note = QLabel(
+            "Интервал и длительность указаны в игровых тиках (60 в секунду). "
+            "Веер стреляет в игрока с разбросом, круг — во все стороны, "
+            "спираль поворачивает каждый залп на шаг спирали."
+        )
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        form.addRow(note)
+
+        self.dash_enabled.toggled.connect(self.update_action_fields)
+        self.shoot_enabled.toggled.connect(self.update_action_fields)
+        self.adds_enabled.toggled.connect(self.update_action_fields)
+        self.adds_npc.currentIndexChanged.connect(
+            self.update_action_fields
+        )
+        self.adds_interval.valueChanged.connect(
+            self.update_action_fields
+        )
+        self.adds_count.valueChanged.connect(self.update_action_fields)
+        self.shoot_source.currentIndexChanged.connect(
+            self.update_action_fields
+        )
+        self.shoot_pattern.currentIndexChanged.connect(
+            self.update_action_fields
+        )
+        self.update_shoot_color_button()
+        self.update_action_fields()
+
+        self.tabs.addTab(tab, "Атаки")
+
+    def build_defense_tab(self):
+        tab, form = make_scroll_form_tab(760)
+
+        grid_host = QWidget()
+        grid = QGridLayout(grid_host)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(8)
+
+        for index, (label, code) in enumerate(BOSS_BUFF_OPTIONS):
+            box = QCheckBox(label)
+            self.immunity_boxes[code] = box
+            grid.addWidget(box, index // 3, index % 3)
+
+        form.addRow("Иммунитеты", grid_host)
+
+        self.contact_enabled = QCheckBox(
+            "Накладывать дебафф при касании"
+        )
+
+        self.contact_buff = QComboBox()
+
+        for label, code in BOSS_BUFF_OPTIONS:
+            self.contact_buff.addItem(label, code)
+
+        self.contact_duration = QSpinBox()
+        self.contact_duration.setRange(1, 36_000)
+        self.contact_duration.setSingleStep(30)
+        self.contact_duration.setSuffix(" тик.")
+        self.contact_duration.setValue(
+            DEFAULT_CONTACT_BUFF["duration_ticks"]
+        )
+
+        form.addRow(self.contact_enabled)
+        form.addRow("Дебафф", self.contact_buff)
+        form.addRow("Длительность", self.contact_duration)
+
+        note = QLabel(
+            "Иммунитеты попадают в SetDefaults, а дебафф при касании — "
+            "в OnHitPlayer. Иммунитет не мешает боссу получать урон."
+        )
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        form.addRow(note)
+
+        self.contact_enabled.toggled.connect(
+            self.update_contact_fields
+        )
+        self.update_contact_fields()
+
+        self.tabs.addTab(tab, "Защита")
+
+    def build_phases_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 12)
+        layout.setSpacing(10)
+
+        hint = QLabel(
+            "Фаза включается, когда у босса остаётся указанный процент "
+            "здоровья. Первая фаза всегда 100%. Скорость и атаки — "
+            "множители к базовым значениям: ×1.5 значит в полтора раза "
+            "быстрее и чаще."
+        )
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.phase_table = QTableWidget(0, 4)
+        self.phase_table.setHorizontalHeaderLabels([
+            "Фаза",
+            "Порог HP",
+            "Скорость",
+            "Атаки",
         ])
+        self.phase_table.verticalHeader().setVisible(False)
+        self.phase_table.verticalHeader().setDefaultSectionSize(40)
+        self.phase_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.phase_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.phase_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.phase_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
 
-        form.addRow("Damage — урон", self.damage)
-        form.addRow("Knockback — отбрасывание", self.knockback)
-        form.addRow("UseTime — время использования", self.use_time)
-        form.addRow("UseAnimation — анимация", self.use_animation)
-        form.addRow("Crit — критический шанс (%)", self.crit)
-        form.addRow("Mana — расход маны", self.mana)
-        form.addRow("ShootSpeed — скорость снаряда", self.shoot_speed)
-        form.addRow("AutoReuse", self.auto_reuse)
-        form.addRow("DamageType — тип урона", self.damage_type)
+        for column in (1, 2, 3):
+            self.phase_table.horizontalHeader().setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents
+            )
 
-        self.tabs.addTab(tab, "Боевые характеристики")
+        layout.addWidget(self.phase_table, 1)
 
-    def focused_text_widget(self):
-        widget = QApplication.focusWidget()
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
 
-        if isinstance(widget, QAbstractSpinBox):
-            widget = widget.lineEdit()
-        elif isinstance(widget, QComboBox) and widget.isEditable():
-            widget = widget.lineEdit()
+        self.add_phase_btn = QPushButton("+ Добавить фазу")
+        self.add_phase_btn.clicked.connect(self.add_phase_row)
 
-        if isinstance(widget, (QLineEdit, QTextEdit, QPlainTextEdit)):
-            return widget
+        self.remove_phase_btn = QPushButton("Удалить фазу")
+        self.remove_phase_btn.clicked.connect(self.remove_phase_row)
 
-        return None
+        self.reset_phases_btn = QPushButton("Сбросить к одной фазе")
+        self.reset_phases_btn.clicked.connect(self.reset_phases)
 
-    def smart_undo(self):
-        text_widget = self.focused_text_widget()
-        if text_widget is not None:
-            text_widget.undo()
-        else:
-            self.canvas.undo()
+        buttons.addWidget(self.add_phase_btn)
+        buttons.addWidget(self.remove_phase_btn)
+        buttons.addWidget(self.reset_phases_btn)
+        buttons.addStretch(1)
 
-    def smart_redo(self):
-        text_widget = self.focused_text_widget()
-        if text_widget is not None:
-            text_widget.redo()
-        else:
-            self.canvas.redo()
+        layout.addLayout(buttons)
 
-    def setup_shortcuts(self):
-        self.shortcuts = []
+        self.phase_hint = QLabel()
+        self.phase_hint.setObjectName("hint")
+        self.phase_hint.setWordWrap(True)
 
-        # Горячие клавиши, работающие во всём окне
-        global_shortcuts = [
-            ("Ctrl+Z", self.smart_undo),
-            ("Ctrl+Y", self.smart_redo),
-            ("Ctrl+Shift+Z", self.smart_redo),
-            ("Ctrl+S", self.save_project),
+        self.phase_effect = QCheckBox(
+            "Вспышка и короткая неуязвимость при смене фазы"
+        )
+        self.phase_effect.setChecked(True)
+        self.phase_effect.setToolTip(
+            "При переходе на новую фазу босс взрывается пылью и на "
+            "полсекунды перестаёт получать урон."
+        )
+
+        layout.addWidget(self.phase_effect)
+        layout.addWidget(self.phase_hint)
+
+        self.tabs.addTab(tab, "Фазы")
+
+    def build_loot_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 12)
+        layout.setSpacing(10)
+
+        hint = QLabel(
+            "Дроп собирается из предметов проекта. Шанс указан в процентах "
+            "на один труп, количество — в штуках. 100% — гарантированный дроп. "
+            "Галочка «Эксперт» оставляет предмет только для эксперта и мастера."
+        )
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.loot_table = QTableWidget(0, 5)
+        self.loot_table.setHorizontalHeaderLabels([
+            "Предмет",
+            "Шанс",
+            "Мин.",
+            "Макс.",
+            "Эксперт",
+        ])
+        self.loot_table.verticalHeader().setVisible(False)
+        self.loot_table.verticalHeader().setDefaultSectionSize(40)
+        self.loot_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.loot_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.loot_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.loot_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+
+        for column in (1, 2, 3, 4):
+            self.loot_table.horizontalHeader().setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents
+            )
+
+        layout.addWidget(self.loot_table, 1)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+
+        self.add_loot_btn = QPushButton("+ Добавить предмет")
+        self.add_loot_btn.clicked.connect(self.add_loot_row)
+
+        self.remove_loot_btn = QPushButton("Удалить строку")
+        self.remove_loot_btn.clicked.connect(self.remove_loot_row)
+
+        buttons.addWidget(self.add_loot_btn)
+        buttons.addWidget(self.remove_loot_btn)
+        buttons.addStretch(1)
+
+        layout.addLayout(buttons)
+
+        self.loot_hint = QLabel()
+        self.loot_hint.setObjectName("hint")
+        self.loot_hint.setWordWrap(True)
+        layout.addWidget(self.loot_hint)
+
+        self.bag_enabled = QCheckBox(
+            "В эксперте и мастере босс выпадает мешком с лутом"
+        )
+        self.bag_enabled.setToolTip(
+            "TMC создаст отдельный предмет-мешок: его класс, иконку и "
+            "локализацию."
+        )
+        layout.addWidget(self.bag_enabled)
+
+        self.bag_hint = QLabel(
+            "Мешок повторяет поведение ванильных сумок боссов: в обычном "
+            "мире добыча выпадает напрямую, а в эксперте и мастере — "
+            "одним мешком. Внутри лежат все предметы таблицы, включая "
+            "те, что отмечены галочкой «Эксперт»."
+        )
+        self.bag_hint.setObjectName("hint")
+        self.bag_hint.setWordWrap(True)
+        layout.addWidget(self.bag_hint)
+
+        self.tabs.addTab(tab, "Дроп")
+
+    def build_script_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.script_editor = ScriptEditor(variant="boss")
+        layout.addWidget(self.script_editor)
+
+        self.tabs.addTab(tab, "Скрипт")
+
+    def build_sprite_tab(self):
+        tab = QWidget()
+        self.sprite_tab = tab
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        self.sprite_preview = QLabel()
+        self.sprite_preview.setObjectName("cardSprite")
+        self.sprite_preview.setFixedSize(260, 260)
+        self.sprite_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        choose_button = QPushButton("Выбрать изображение…")
+        choose_button.clicked.connect(self.choose_sprite)
+
+        fit_button = QPushButton("Подогнать хитбокс под спрайт")
+        fit_button.clicked.connect(self.fit_hitbox_to_sprite)
+
+        fit_art_button = QPushButton("Подогнать по рисунку")
+        fit_art_button.setToolTip(
+            "Берёт только непрозрачные пиксели: прозрачные поля холста "
+            "не попадут в хитбокс."
+        )
+        fit_art_button.clicked.connect(self.fit_hitbox_to_art)
+
+        self.sprite_info = QLabel()
+        self.sprite_info.setObjectName("hint")
+        self.sprite_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        layout.addWidget(
+            self.sprite_preview, 0, Qt.AlignmentFlag.AlignHCenter
+        )
+        layout.addWidget(choose_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(fit_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(fit_art_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(self.sprite_info)
+        layout.addStretch(1)
+
+        self.tabs.addTab(tab, "Спрайт")
+
+    def build_animation_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        hint = QLabel(
+            "У каждого состояния своя лента кадров. В игре босс "
+            "переключает их по действию: покой, движение, атака и прыжок. "
+            "Состояние без кадров берёт ленту движения."
+        )
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.animation_tabs = QTabWidget()
+        layout.addWidget(self.animation_tabs, 1)
+
+        for state, label in BOSS_ANIMATION_STATES:
+            editor = AnimationEditor()
+            editor.add_frame_requested.connect(
+                lambda checked=False, target=editor: target.add_frame(
+                    self.sprite
+                )
+            )
+            self.animation_editors[state] = editor
+            self.animation_tabs.addTab(editor, label)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(10)
+
+        copy_button = QPushButton(
+            "Скопировать ленту во все состояния"
+        )
+        copy_button.setToolTip(
+            "Удобно, когда у босса одна анимация: нарисуй её один раз "
+            "и разложи по остальным состояниям."
+        )
+        copy_button.clicked.connect(self.copy_animation_to_all)
+
+        self.animation_note = QLabel()
+        self.animation_note.setObjectName("hint")
+        self.animation_note.setWordWrap(True)
+
+        controls.addWidget(copy_button)
+        controls.addWidget(self.animation_note, 1)
+        layout.addLayout(controls)
+
+        self.tabs.addTab(tab, "Анимация")
+
+    def copy_animation_to_all(self):
+        """Дублирует ленту открытого состояния в остальные состояния."""
+
+        index = self.animation_tabs.currentIndex()
+
+        if not (0 <= index < len(BOSS_ANIMATION_STATES)):
+            return
+
+        state, label = BOSS_ANIMATION_STATES[index]
+        source = self.animation_editors[state].frames
+
+        if not source:
+            self.animation_note.setText(
+                f"В состоянии «{label}» нет кадров — копировать нечего."
+            )
+            return
+
+        for other_state, editor in self.animation_editors.items():
+            if other_state == state:
+                continue
+
+            editor.set_animation({
+                "frames": [
+                    {
+                        "image": frame["image"].copy(),
+                        "duration_ms": int(frame["duration_ms"]),
+                    }
+                    for frame in source
+                ],
+                "loop": bool(editor.loop),
+            })
+
+        self.animation_note.setText(
+            f"Лента «{label}» ({len(source)} кадр.) скопирована "
+            "в остальные состояния."
+        )
+        self.schedule_issue_check()
+
+    def build_preview_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+        controls.addWidget(QLabel("Состояние:"))
+
+        self.preview_state = QComboBox()
+
+        for state, label in BOSS_ANIMATION_STATES:
+            self.preview_state.addItem(label, state)
+
+        self.preview_state.currentIndexChanged.connect(
+            self.update_preview_state
+        )
+        controls.addWidget(self.preview_state)
+        controls.addStretch(1)
+
+        self.preview = BossPreview(
+            BOSS_AI_LABELS,
+            BOSS_SHOOT_PATTERN_LABELS,
+            BOSS_ANIMATION_STATES,
+        )
+
+        layout.addLayout(controls)
+        layout.addWidget(self.preview, 1)
+
+        note = QLabel(
+            "Предпросмотр показывает, как босс будет выглядеть в бою: "
+            "полоса здоровья с метками фаз, кадры анимации и сводка атак. "
+            "Это только просмотр — на генерацию он не влияет."
+        )
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.tabs.addTab(tab, "Предпросмотр")
+
+    # --------------------------------------------------------
+    # DATA
+    # --------------------------------------------------------
+
+    def connect_change_signals(self):
+        """Любое изменение в форме откладывает пересчёт замечаний."""
+
+        for widget in self.findChildren(QLineEdit):
+            widget.textChanged.connect(self.schedule_issue_check)
+
+        for widget in self.findChildren(QPlainTextEdit):
+            widget.textChanged.connect(self.schedule_issue_check)
+
+        for widget in self.findChildren(QSpinBox):
+            widget.valueChanged.connect(self.schedule_issue_check)
+
+        for widget in self.findChildren(QDoubleSpinBox):
+            widget.valueChanged.connect(self.schedule_issue_check)
+
+        for widget in self.findChildren(QComboBox):
+            widget.currentIndexChanged.connect(self.schedule_issue_check)
+
+        for widget in self.findChildren(QCheckBox):
+            widget.toggled.connect(self.schedule_issue_check)
+
+    def set_item_choices(self, items):
+        """Запоминает предметы проекта для таблицы дропа."""
+
+        self.item_choices = [
+            (key, obj.get("data", {}).get("name", key))
+            for key, obj in items.items()
         ]
 
-        for key, action in global_shortcuts:
-            shortcut = QShortcut(QKeySequence(key), self)
-            shortcut.setContext(
-                Qt.ShortcutContext.ApplicationShortcut
+        self.add_loot_btn.setEnabled(bool(self.item_choices))
+
+        if self.item_choices:
+            self.loot_hint.setText(
+                "Доступно предметов: "
+                f"{len(self.item_choices)}. Список берётся из категории "
+                "«Предметы»."
             )
-            shortcut.activated.connect(action)
-            self.shortcuts.append(shortcut)
-
-        # Инструменты, работающие при фокусе на холсте
-        canvas_shortcuts = [
-            ("E", lambda: self.toggle_eraser(True)),
-            ("B", lambda: self.toggle_eraser(False)),
-            ("G", lambda: self.fill_btn.setChecked(
-                not self.fill_btn.isChecked()
-            )),
-        ]
-
-        for key, action in canvas_shortcuts:
-            shortcut = QShortcut(QKeySequence(key), self.canvas)
-            shortcut.setContext(
-                Qt.ShortcutContext.WidgetShortcut
+        else:
+            self.loot_hint.setText(
+                "В проекте пока нет предметов: создай их в категории "
+                "«Предметы», чтобы добавить дроп."
             )
-            shortcut.activated.connect(action)
-            self.shortcuts.append(shortcut)
 
-# ============================================================
-# APPLICATION
-# ============================================================
+    def set_boss(self, data, sprite, animations=None):
+        """Показывает данные босса в форме."""
 
-if __name__ == "__main__":
+        raw = data if isinstance(data, dict) else {}
 
-    app = QApplication(sys.argv)
+        # Анимации приходят отдельным аргументом и живут в редакторах
+        # кадров. В копию данных их кладём только при сохранении: QImage
+        # нельзя deepcopy, а форма должна переживать переключение боссов.
+        if animations is None:
+            animations = normalize_boss_animations(raw)
 
-    # Загружаем JetBrains Mono из папки fonts рядом с main.py.
-    # Если файла нет, Qt попробует найти шрифт, установленный в системе.
-    font_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "fonts" / "JetBrainsMono-Regular.ttf"
-    font_id = -1
+        self.loading = True
+        self._data = copy.deepcopy({
+            key: value
+            for key, value in raw.items()
+            if key not in ("animations", "animation")
+        })
 
-    if font_path.exists():
-        font_id = QFontDatabase.addApplicationFont(str(font_path))
+        self.name.setText(self._data.get("name", "Новый босс"))
+        self.internal_id.setText(self._data.get("internal_id", ""))
+        self.description.setPlainText(
+            self._data.get("description", "")
+        )
 
-    if font_id >= 0:
-        font_families = QFontDatabase.applicationFontFamilies(font_id)
-        font_family = font_families[0] if font_families else "JetBrains Mono"
-    else:
-        font_family = "JetBrains Mono"
+        summon = _as_dict(self._data.get("summon"))
+        self.summon_enabled.setChecked(
+            bool(summon.get("enabled", True))
+        )
 
-    app.setFont(QFont(font_family, 10))
+        recipe = _as_dict(summon.get("recipe"))
+        self.summon_recipe_enabled.setChecked(
+            bool(recipe.get("enabled", DEFAULT_SUMMON_RECIPE["enabled"]))
+        )
 
-    window = TMCWindow()
-    window.show()
+        recipe_index = self.summon_recipe_item.findData(
+            recipe.get("item", DEFAULT_SUMMON_RECIPE["item"])
+        )
+        self.summon_recipe_item.setCurrentIndex(max(0, recipe_index))
+        self.summon_recipe_count.setValue(
+            _clamped_int(
+                recipe.get("count"),
+                DEFAULT_SUMMON_RECIPE["count"],
+                1,
+                999,
+            )
+        )
+        station_index = self.summon_recipe_station.findData(
+            recipe.get("station", DEFAULT_SUMMON_RECIPE["station"])
+        )
+        self.summon_recipe_station.setCurrentIndex(max(0, station_index))
+        self.update_summon_fields()
 
-    sys.exit(app.exec())
+        music_index = self.music.findData(
+            self._data.get("music", "")
+        )
+        self.music.setCurrentIndex(max(0, music_index))
+
+        stats = _as_dict(self._data.get("stats"))
+
+        self.life_max.setValue(
+            _clamped_int(
+                stats.get("life_max"),
+                DEFAULT_BOSS_STATS["life_max"],
+                1,
+                10_000_000,
+            )
+        )
+        self.damage.setValue(
+            _clamped_int(
+                stats.get("damage"), DEFAULT_BOSS_STATS["damage"], 0, 100_000
+            )
+        )
+        self.defense.setValue(
+            _clamped_int(
+                stats.get("defense"),
+                DEFAULT_BOSS_STATS["defense"],
+                0,
+                10_000,
+            )
+        )
+        self.knockback_resist.setValue(
+            _clamped_float(
+                stats.get("knockback_resist"),
+                DEFAULT_BOSS_STATS["knockback_resist"],
+                0.0,
+                1.0,
+            )
+        )
+        self.width.setValue(
+            _clamped_int(stats.get("width"), DEFAULT_BOSS_STATS["width"], 8, 1024)
+        )
+        self.height.setValue(
+            _clamped_int(
+                stats.get("height"), DEFAULT_BOSS_STATS["height"], 8, 1024
+            )
+        )
+        self.scale.setValue(
+            _clamped_float(
+                stats.get("scale"), DEFAULT_BOSS_STATS["scale"], 0.1, 10.0
+            )
+        )
+        self.value.setValue(
+            _clamped_int(
+                stats.get("value_copper"),
+                DEFAULT_BOSS_STATS["value_copper"],
+                0,
+                2_000_000_000,
+            )
+        )
+
+        ai_code = stats.get("ai", DEFAULT_BOSS_STATS["ai"])
+        ai_index = self.ai.findData(ai_code)
+        self.ai.setCurrentIndex(max(0, ai_index))
+
+        self.movement_speed.setValue(
+            _clamped_float(
+                stats.get("movement_speed"),
+                DEFAULT_BOSS_STATS["movement_speed"],
+                0.1,
+                30.0,
+            )
+        )
+        self.hover_height.setValue(
+            _clamped_int(
+                stats.get("hover_height"),
+                DEFAULT_BOSS_STATS["hover_height"],
+                0,
+                3000,
+            )
+        )
+        self.jump_force.setValue(
+            _clamped_float(
+                stats.get("jump_force"),
+                DEFAULT_BOSS_STATS["jump_force"],
+                1.0,
+                30.0,
+            )
+        )
+        self.orbit_radius.setValue(
+            _clamped_int(
+                stats.get("orbit_radius"),
+                DEFAULT_BOSS_STATS["orbit_radius"],
+                40,
+                1500,
+            )
+        )
+        self.orbit_speed.setValue(
+            _clamped_float(
+                stats.get("orbit_speed"),
+                DEFAULT_BOSS_STATS["orbit_speed"],
+                0.1,
+                12.0,
+            )
+        )
+        self.teleport_interval.setValue(
+            _clamped_int(
+                stats.get("teleport_interval"),
+                DEFAULT_BOSS_STATS["teleport_interval"],
+                30,
+                36_000,
+            )
+        )
+        self.teleport_range.setValue(
+            _clamped_int(
+                stats.get("teleport_range"),
+                DEFAULT_BOSS_STATS["teleport_range"],
+                60,
+                1200,
+            )
+        )
+        self.charge_speed.setValue(
+            _clamped_float(
+                stats.get("charge_speed"),
+                DEFAULT_BOSS_STATS["charge_speed"],
+                2.0,
+                40.0,
+            )
+        )
+        self.charge_pause.setValue(
+            _clamped_int(
+                stats.get("charge_pause"),
+                DEFAULT_BOSS_STATS["charge_pause"],
+                10,
+                1200,
+            )
+        )
+        self.expert_life_percent.setValue(
+            _clamped_int(
+                stats.get("expert_life_percent"),
+                DEFAULT_BOSS_STATS["expert_life_percent"],
+                50,
+                1000,
+            )
+        )
+        self.master_life_percent.setValue(
+            _clamped_int(
+                stats.get("master_life_percent"),
+                DEFAULT_BOSS_STATS["master_life_percent"],
+                50,
+                1000,
+            )
+        )
+
+        actions = _as_dict(self._data.get("actions"))
+        dash = _as_dict(actions.get("dash"))
+
+        self.dash_enabled.setChecked(
+            bool(dash.get("enabled", DEFAULT_DASH["enabled"]))
+        )
+        self.dash_interval.setValue(
+            _clamped_int(
+                dash.get("interval_ticks"),
+                DEFAULT_DASH["interval_ticks"],
+                30,
+                36_000,
+            )
+        )
+        self.dash_speed.setValue(
+            _clamped_float(
+                dash.get("speed"), DEFAULT_DASH["speed"], 1.0, 60.0
+            )
+        )
+        self.dash_duration.setValue(
+            _clamped_int(
+                dash.get("duration_ticks"),
+                DEFAULT_DASH["duration_ticks"],
+                5,
+                600,
+            )
+        )
+        self.dash_expert_only.setChecked(
+            bool(dash.get("expert_only", False))
+        )
+
+        shoot = _as_dict(actions.get("shoot"))
+
+        self.shoot_enabled.setChecked(
+            bool(shoot.get("enabled", DEFAULT_SHOOT["enabled"]))
+        )
+        self.shoot_interval.setValue(
+            _clamped_int(
+                shoot.get("interval_ticks"),
+                DEFAULT_SHOOT["interval_ticks"],
+                30,
+                36_000,
+            )
+        )
+
+        pattern_index = self.shoot_pattern.findData(
+            shoot.get("pattern", DEFAULT_SHOOT["pattern"])
+        )
+        self.shoot_pattern.setCurrentIndex(max(0, pattern_index))
+
+        source_index = self.shoot_source.findData(
+            shoot.get("source", DEFAULT_SHOOT["source"])
+        )
+        self.shoot_source.setCurrentIndex(max(0, source_index))
+
+        projectile_index = self.shoot_projectile.findData(
+            shoot.get("projectile", DEFAULT_SHOOT["projectile"])
+        )
+        self.shoot_projectile.setCurrentIndex(max(0, projectile_index))
+
+        color = QColor(
+            str(shoot.get("color") or DEFAULT_SHOOT["color"])
+        )
+
+        if not color.isValid():
+            color = QColor(DEFAULT_SHOOT["color"])
+
+        self.shoot_color = color
+        self.update_shoot_color_button()
+
+        self.shoot_radius.setValue(
+            _clamped_int(
+                shoot.get("radius"), DEFAULT_SHOOT["radius"], 4, 64
+            )
+        )
+        self.shoot_homing.setValue(
+            _clamped_float(
+                shoot.get("homing"), DEFAULT_SHOOT["homing"], 0.0, 1.0
+            )
+        )
+        self.shoot_pierce.setValue(
+            _clamped_int(
+                shoot.get("pierce"), DEFAULT_SHOOT["pierce"], 1, 10
+            )
+        )
+        self.shoot_lifetime.setValue(
+            _clamped_int(
+                shoot.get("lifetime_ticks"),
+                DEFAULT_SHOOT["lifetime_ticks"],
+                60,
+                1800,
+            )
+        )
+        self.shoot_spiral_step.setValue(
+            _clamped_float(
+                shoot.get("spiral_step"),
+                DEFAULT_SHOOT["spiral_step"],
+                1.0,
+                90.0,
+            )
+        )
+        self.shoot_damage.setValue(
+            _clamped_int(
+                shoot.get("damage"), DEFAULT_SHOOT["damage"], 0, 100_000
+            )
+        )
+        self.shoot_count.setValue(
+            _clamped_int(shoot.get("count"), DEFAULT_SHOOT["count"], 1, 20)
+        )
+        self.shoot_spread.setValue(
+            _clamped_float(
+                shoot.get("spread_degrees"),
+                DEFAULT_SHOOT["spread_degrees"],
+                0.0,
+                180.0,
+            )
+        )
+        self.shoot_speed.setValue(
+            _clamped_float(
+                shoot.get("speed"), DEFAULT_SHOOT["speed"], 1.0, 60.0
+            )
+        )
+        self.shoot_expert_only.setChecked(
+            bool(shoot.get("expert_only", False))
+        )
+
+        adds = _as_dict(actions.get("summon"))
+
+        self.adds_enabled.setChecked(
+            bool(adds.get("enabled", DEFAULT_ADD_ATTACK["enabled"]))
+        )
+        self.adds_interval.setValue(
+            _clamped_int(
+                adds.get("interval_ticks"),
+                DEFAULT_ADD_ATTACK["interval_ticks"],
+                60,
+                36_000,
+            )
+        )
+
+        npc_index = self.adds_npc.findData(
+            normalize_adds_npc(
+                adds.get("npc", DEFAULT_ADD_ATTACK["npc"])
+            )
+        )
+        self.adds_npc.setCurrentIndex(max(0, npc_index))
+        self.adds_count.setValue(
+            _clamped_int(
+                adds.get("count"), DEFAULT_ADD_ATTACK["count"], 1, 10
+            )
+        )
+        self.adds_expert_only.setChecked(
+            bool(adds.get("expert_only", False))
+        )
+
+        defense = _as_dict(self._data.get("defense"))
+        immunities = _as_list(defense.get("immunities"))
+
+        for code, box in self.immunity_boxes.items():
+            box.setChecked(code in immunities)
+
+        contact = _as_dict(defense.get("contact_buff"))
+
+        self.contact_enabled.setChecked(
+            bool(contact.get("enabled", DEFAULT_CONTACT_BUFF["enabled"]))
+        )
+        buff_index = self.contact_buff.findData(
+            contact.get("buff", DEFAULT_CONTACT_BUFF["buff"])
+        )
+        self.contact_buff.setCurrentIndex(max(0, buff_index))
+        self.contact_duration.setValue(
+            _clamped_int(
+                contact.get("duration_ticks"),
+                DEFAULT_CONTACT_BUFF["duration_ticks"],
+                1,
+                36_000,
+            )
+        )
+
+        self.set_phases(self._data.get("phases"))
+        self.phase_effect.setChecked(
+            bool(self._data.get("phase_effect", True))
+        )
+        self.set_loot(_as_list(self._data.get("loot")))
+        self.bag_enabled.setChecked(
+            bool(_as_dict(self._data.get("bag")).get("enabled", False))
+        )
+        self.script_editor.set_script(_as_dict(self._data.get("script")))
+
+        normalized = {}
+
+        for state, _label in BOSS_ANIMATION_STATES:
+            animation = _as_dict(
+                animations.get(state)
+                if isinstance(animations, dict)
+                else None
+            )
+            frames = _as_list(animation.get("frames"))
+            normalized[state] = {
+                "frames": list(frames),
+                "loop": bool(
+                    animation.get("loop", state != "attack")
+                ),
+            }
+
+        animations = normalized
+
+        for state, editor in self.animation_editors.items():
+            editor.set_animation(
+                animations.get(
+                    state,
+                    {"frames": [], "loop": state != "attack"},
+                )
+            )
+
+        self.sprite = (
+            sprite.copy() if isinstance(sprite, QImage) else QImage()
+        )
+        self.refresh_sprite()
+
+        self.tabs.setEnabled(True)
+        self.loading = False
+        self.update_title()
+        self.update_ai_fields()
+        self.update_action_fields()
+        self.update_contact_fields()
+        self.refresh_issues()
+
+    def collect_data(self):
+        """Поля формы в формате данных босса, без анимаций и спрайта."""
+
+        return {
+            "schema_version": 3,
+            "kind": "boss",
+            "name": self.name.text().strip(),
+            "internal_id": self.internal_id.text().strip(),
+            "description": self.description.toPlainText().strip(),
+            "music": self.music.currentData() or "",
+            "stats": {
+                "life_max": self.life_max.value(),
+                "damage": self.damage.value(),
+                "defense": self.defense.value(),
+                "knockback_resist": self.knockback_resist.value(),
+                "width": self.width.value(),
+                "height": self.height.value(),
+                "scale": self.scale.value(),
+                "value_copper": self.value.value(),
+                "ai": self.ai.currentData(),
+                "movement_speed": self.movement_speed.value(),
+                "hover_height": self.hover_height.value(),
+                "jump_force": self.jump_force.value(),
+                "orbit_radius": self.orbit_radius.value(),
+                "orbit_speed": self.orbit_speed.value(),
+                "teleport_interval": self.teleport_interval.value(),
+                "teleport_range": self.teleport_range.value(),
+                "charge_speed": self.charge_speed.value(),
+                "charge_pause": self.charge_pause.value(),
+                "expert_life_percent": self.expert_life_percent.value(),
+                "master_life_percent": self.master_life_percent.value(),
+            },
+            "phases": self.get_phases(),
+            "phase_effect": self.phase_effect.isChecked(),
+            "actions": {
+                "dash": {
+                    "enabled": self.dash_enabled.isChecked(),
+                    "interval_ticks": self.dash_interval.value(),
+                    "speed": self.dash_speed.value(),
+                    "duration_ticks": self.dash_duration.value(),
+                    "expert_only": self.dash_expert_only.isChecked(),
+                },
+                "shoot": {
+                    "enabled": self.shoot_enabled.isChecked(),
+                    "interval_ticks": self.shoot_interval.value(),
+                    "pattern": self.shoot_pattern.currentData(),
+                    "source": self.shoot_source.currentData(),
+                    "projectile": self.shoot_projectile.currentData(),
+                    "damage": self.shoot_damage.value(),
+                    "count": self.shoot_count.value(),
+                    "spread_degrees": self.shoot_spread.value(),
+                    "speed": self.shoot_speed.value(),
+                    "spiral_step": self.shoot_spiral_step.value(),
+                    "color": self.shoot_color.name(),
+                    "radius": self.shoot_radius.value(),
+                    "homing": self.shoot_homing.value(),
+                    "pierce": self.shoot_pierce.value(),
+                    "lifetime_ticks": self.shoot_lifetime.value(),
+                    "expert_only": self.shoot_expert_only.isChecked(),
+                },
+                "summon": {
+                    "enabled": self.adds_enabled.isChecked(),
+                    "interval_ticks": self.adds_interval.value(),
+                    "npc": self.adds_npc.currentData(),
+                    "count": self.adds_count.value(),
+                    "expert_only": self.adds_expert_only.isChecked(),
+                },
+            },
+            "defense": {
+                "immunities": [
+                    code
+                    for code, box in self.immunity_boxes.items()
+                    if box.isChecked()
+                ],
+                "contact_buff": {
+                    "enabled": self.contact_enabled.isChecked(),
+                    "buff": self.contact_buff.currentData(),
+                    "duration_ticks": self.contact_duration.value(),
+                },
+            },
+            "loot": self.get_loot(),
+            "bag": {
+                "enabled": self.bag_enabled.isChecked(),
+            },
+            "summon": {
+                "enabled": self.summon_enabled.isChecked(),
+                "recipe": {
+                    "enabled": self.summon_recipe_enabled.isChecked(),
+                    "item": self.summon_recipe_item.currentData(),
+                    "count": self.summon_recipe_count.value(),
+                    "station": self.summon_recipe_station.currentData(),
+                },
+            },
+            "script": self.script_editor.get_script(),
+        }
+
+    def animation_snapshot(self):
+        """Анимации без копирования картинок — для проверок и предпросмотра."""
+
+        return {
+            state: {
+                "frames": [
+                    {
+                        "image": frame["image"],
+                        "duration_ms": int(frame["duration_ms"]),
+                    }
+                    for frame in editor.frames
+                    if isinstance(frame.get("image"), QImage)
+                ],
+                "loop": bool(editor.loop),
+            }
+            for state, editor in self.animation_editors.items()
+        }
+
+    def get_boss(self):
+        """Собирает данные из формы: (data, sprite, animations)."""
+
+        data = copy.deepcopy(self._data)
+        data.update(self.collect_data())
+
+        animations = {
+            state: editor.get_animation()
+            for state, editor in self.animation_editors.items()
+        }
+
+        data["animations"] = animations
+        data["animation"] = animations.get(
+            "move", {"frames": [], "loop": True}
+        )
+
+        return data, self.sprite.copy(), animations
+
+    def clear(self):
+        """Сбрасывает форму, когда босс не выбран."""
+
+        self.loading = True
+        self._data = {}
+        self.sprite = QImage()
+        self.shoot_color = QColor(DEFAULT_SHOOT["color"])
+
+        self.name.clear()
+        self.internal_id.clear()
+        self.description.clear()
+        self.summon_enabled.setChecked(True)
+        self.summon_recipe_enabled.setChecked(False)
+        self.summon_recipe_item.setCurrentIndex(0)
+        self.summon_recipe_count.setValue(
+            DEFAULT_SUMMON_RECIPE["count"]
+        )
+        self.summon_recipe_station.setCurrentIndex(0)
+        self.update_summon_fields()
+        self.music.setCurrentIndex(0)
+
+        self.life_max.setValue(DEFAULT_BOSS_STATS["life_max"])
+        self.damage.setValue(DEFAULT_BOSS_STATS["damage"])
+        self.defense.setValue(DEFAULT_BOSS_STATS["defense"])
+        self.knockback_resist.setValue(
+            DEFAULT_BOSS_STATS["knockback_resist"]
+        )
+        self.width.setValue(DEFAULT_BOSS_STATS["width"])
+        self.height.setValue(DEFAULT_BOSS_STATS["height"])
+        self.scale.setValue(DEFAULT_BOSS_STATS["scale"])
+        self.value.setValue(DEFAULT_BOSS_STATS["value_copper"])
+        self.ai.setCurrentIndex(0)
+        self.movement_speed.setValue(
+            DEFAULT_BOSS_STATS["movement_speed"]
+        )
+        self.hover_height.setValue(
+            DEFAULT_BOSS_STATS["hover_height"]
+        )
+        self.jump_force.setValue(DEFAULT_BOSS_STATS["jump_force"])
+        self.orbit_radius.setValue(DEFAULT_BOSS_STATS["orbit_radius"])
+        self.orbit_speed.setValue(DEFAULT_BOSS_STATS["orbit_speed"])
+        self.teleport_interval.setValue(
+            DEFAULT_BOSS_STATS["teleport_interval"]
+        )
+        self.teleport_range.setValue(
+            DEFAULT_BOSS_STATS["teleport_range"]
+        )
+        self.charge_speed.setValue(DEFAULT_BOSS_STATS["charge_speed"])
+        self.charge_pause.setValue(DEFAULT_BOSS_STATS["charge_pause"])
+        self.expert_life_percent.setValue(
+            DEFAULT_BOSS_STATS["expert_life_percent"]
+        )
+        self.master_life_percent.setValue(
+            DEFAULT_BOSS_STATS["master_life_percent"]
+        )
+
+        self.dash_enabled.setChecked(False)
+        self.dash_interval.setValue(DEFAULT_DASH["interval_ticks"])
+        self.dash_speed.setValue(DEFAULT_DASH["speed"])
+        self.dash_duration.setValue(DEFAULT_DASH["duration_ticks"])
+        self.dash_expert_only.setChecked(False)
+
+        self.shoot_enabled.setChecked(False)
+        self.shoot_interval.setValue(DEFAULT_SHOOT["interval_ticks"])
+        self.shoot_pattern.setCurrentIndex(0)
+        self.shoot_source.setCurrentIndex(0)
+        self.shoot_projectile.setCurrentIndex(0)
+        self.shoot_radius.setValue(DEFAULT_SHOOT["radius"])
+        self.shoot_homing.setValue(DEFAULT_SHOOT["homing"])
+        self.shoot_pierce.setValue(DEFAULT_SHOOT["pierce"])
+        self.shoot_lifetime.setValue(DEFAULT_SHOOT["lifetime_ticks"])
+        self.shoot_spiral_step.setValue(DEFAULT_SHOOT["spiral_step"])
+        self.shoot_damage.setValue(DEFAULT_SHOOT["damage"])
+        self.shoot_count.setValue(DEFAULT_SHOOT["count"])
+        self.shoot_spread.setValue(DEFAULT_SHOOT["spread_degrees"])
+        self.shoot_speed.setValue(DEFAULT_SHOOT["speed"])
+        self.shoot_expert_only.setChecked(False)
+        self.update_shoot_color_button()
+
+        self.adds_enabled.setChecked(False)
+        self.adds_interval.setValue(
+            DEFAULT_ADD_ATTACK["interval_ticks"]
+        )
+        self.adds_npc.setCurrentIndex(0)
+        self.adds_count.setValue(DEFAULT_ADD_ATTACK["count"])
+        self.adds_expert_only.setChecked(False)
+
+        for box in self.immunity_boxes.values():
+            box.setChecked(False)
+
+        self.contact_enabled.setChecked(False)
+        self.contact_buff.setCurrentIndex(0)
+        self.contact_duration.setValue(
+            DEFAULT_CONTACT_BUFF["duration_ticks"]
+        )
+
+        self.set_phases(None)
+        self.phase_effect.setChecked(True)
+        self.set_loot([])
+        self.bag_enabled.setChecked(False)
+        self.script_editor.set_script(None)
+
+        for state, editor in self.animation_editors.items():
+            editor.set_animation({
+                "frames": [],
+                "loop": state != "attack",
+            })
+
+        self.animation_note.setText("")
+
+        self.refresh_sprite()
+
+        self.title_label.setText("Босс не выбран")
+        self.tabs.setEnabled(False)
+        self.loading = False
+        self.update_ai_fields()
+        self.update_action_fields()
+        self.update_contact_fields()
+        self.preview.set_data({}, QImage(), {})
+        self.issues_label.setText("")
+
+    def update_title(self):
+        if self.loading:
+            return
+
+        name = self.name.text().strip() or "без названия"
+        self.title_label.setText(f"Босс: {name}")
+
+    def update_ai_fields(self, *_):
+        """Показывает только те поля, которые нужны выбранному поведению."""
+
+        ai = self.ai.currentData() or "hover"
+
+        visible = {
+            "hover": {"hover_height"},
+            "jump": {"jump_force"},
+            "orbit": {"orbit_radius", "orbit_speed"},
+            "teleport": {"teleport_interval", "teleport_range",
+                         "hover_height"},
+            "charge": {"charge_speed", "charge_pause"},
+        }.get(ai, set())
+
+        rows = (
+            ("hover_height", self.hover_height),
+            ("jump_force", self.jump_force),
+            ("orbit_radius", self.orbit_radius),
+            ("orbit_speed", self.orbit_speed),
+            ("teleport_interval", self.teleport_interval),
+            ("teleport_range", self.teleport_range),
+            ("charge_speed", self.charge_speed),
+            ("charge_pause", self.charge_pause),
+        )
+
+        for key, widget in rows:
+            _set_row_visible(self.general_form, widget, key in visible)
+
+        self.ai_label.setText(
+            BOSS_AI_DESCRIPTIONS.get(ai, BOSS_AI_DESCRIPTIONS["hover"])
+        )
+
+    def update_action_fields(self, *_):
+        """Включает и скрывает поля у отмеченных атак."""
+
+        dash = self.dash_enabled.isChecked()
+
+        for widget in (
+            self.dash_interval,
+            self.dash_speed,
+            self.dash_duration,
+        ):
+            widget.setEnabled(dash)
+
+        self.dash_expert_only.setEnabled(dash)
+
+        shoot = self.shoot_enabled.isChecked()
+
+        for widget in (
+            self.shoot_interval,
+            self.shoot_pattern,
+            self.shoot_source,
+            self.shoot_damage,
+            self.shoot_count,
+            self.shoot_speed,
+        ):
+            widget.setEnabled(shoot)
+
+        self.shoot_expert_only.setEnabled(shoot)
+
+        custom = (self.shoot_source.currentData() or "vanilla") == "custom"
+
+        _set_row_visible(
+            self.attacks_form,
+            self.shoot_projectile,
+            shoot and not custom,
+        )
+
+        for widget in (
+            self.shoot_color_button,
+            self.shoot_radius,
+            self.shoot_homing,
+            self.shoot_pierce,
+            self.shoot_lifetime,
+        ):
+            _set_row_visible(
+                self.attacks_form, widget, shoot and custom
+            )
+            widget.setEnabled(shoot)
+
+        pattern = self.shoot_pattern.currentData() or "fan"
+
+        _set_row_visible(
+            self.attacks_form,
+            self.shoot_spiral_step,
+            shoot and pattern == "spiral",
+        )
+        _set_row_visible(
+            self.attacks_form,
+            self.shoot_spread,
+            shoot and pattern in ("fan", "spiral"),
+        )
+
+        self.shoot_spiral_step.setEnabled(shoot)
+        self.shoot_spread.setEnabled(shoot)
+
+        self.update_attack_note(pattern, custom)
+
+        adds = self.adds_enabled.isChecked()
+
+        for widget in (
+            self.adds_interval,
+            self.adds_npc,
+            self.adds_count,
+        ):
+            widget.setEnabled(adds)
+
+        self.adds_expert_only.setEnabled(adds)
+
+        if adds:
+            npc_label = self.adds_npc.currentText()
+            interval = self.adds_interval.value() / 60.0
+            count = self.adds_count.value()
+            self.adds_note.setText(
+                f"Каждые {interval:.1f} с босс призывает «{npc_label}» "
+                f"×{count}. Мобы появляются вокруг босса и дальше живут "
+                "сами. Не ставь слишком частый призыв: экран забьётся."
+            )
+        else:
+            self.adds_note.setText(
+                "Босс может звать на помощь ванильных мобов: выбери моба, "
+                "интервал и количество. Это украшает бой и не даёт игроку "
+                "спокойно сосредоточиться на боссе."
+            )
+
+    def update_attack_note(self, pattern, custom):
+        if not self.shoot_enabled.isChecked():
+            text = (
+                "Рывок и выстрел используют готовые ванильные снаряды, "
+                "поэтому отдельные текстуры для них не нужны."
+            )
+        elif custom:
+            text = (
+                "TMC создаст собственный класс снаряда и текстуру-орб: "
+                "цвет, радиус, наведение и время жизни задаются здесь. "
+                "Все выстрелы босса используют этот снаряд."
+            )
+        else:
+            text = (
+                "Снаряд берётся из ванильной игры: отдельные текстуры "
+                "для него не нужны, он уже есть в Terraria."
+            )
+
+        if self.shoot_enabled.isChecked():
+            if pattern == "fan":
+                text += (
+                    " Веер: количество снарядов летит в игрока с шагом "
+                    "разброса."
+                )
+            elif pattern == "radial":
+                text += (
+                    " Круг: снаряды делят 360° поровну, поле разброса "
+                    "не используется."
+                )
+            else:
+                text += (
+                    " Спираль: каждый залп поворачивается на шаг спирали, "
+                    "разброс задаёт угол между снарядами в залпе."
+                )
+
+        self.attack_note.setText(text)
+
+    def update_contact_fields(self, *_):
+        enabled = self.contact_enabled.isChecked()
+        self.contact_buff.setEnabled(enabled)
+        self.contact_duration.setEnabled(enabled)
+
+    def update_summon_fields(self, *_):
+        """Показывает поля рецепта только у включённого призыва."""
+
+        summon = self.summon_enabled.isChecked()
+        recipe = summon and self.summon_recipe_enabled.isChecked()
+
+        _set_row_visible(
+            self.general_form, self.summon_recipe_enabled, summon
+        )
+
+        for widget in (
+            self.summon_recipe_item,
+            self.summon_recipe_count,
+            self.summon_recipe_station,
+        ):
+            _set_row_visible(self.general_form, widget, recipe)
+            widget.setEnabled(recipe)
+
+    def update_template_hint(self, *_):
+        index = self.template_box.currentIndex()
+
+        if 0 <= index < len(BOSS_TEMPLATES):
+            self.template_hint.setText(BOSS_TEMPLATES[index]["hint"])
+
+    def update_shoot_color_button(self):
+        color = self.shoot_color
+
+        self.shoot_color_button.setText(color.name().upper())
+        self.shoot_color_button.setStyleSheet(
+            "QPushButton {"
+            f"background-color: {color.name()};"
+            "color: #12151a;"
+            "font-weight: 700;"
+            "border: 1px solid #12151a;"
+            "}"
+        )
+
+    def choose_shoot_color(self):
+        color = QColorDialog.getColor(
+            self.shoot_color, self, "Цвет своего снаряда"
+        )
+
+        if not color.isValid():
+            return
+
+        self.shoot_color = color
+        self.update_shoot_color_button()
+        self.schedule_issue_check()
+
+    def apply_template(self):
+        """Заполняет характеристики и атаки выбранным шаблоном."""
+
+        index = self.template_box.currentIndex()
+
+        if not (0 <= index < len(BOSS_TEMPLATES)):
+            return
+
+        template = BOSS_TEMPLATES[index]
+
+        self.apply_stats(template.get("stats", {}))
+        self.apply_actions(template.get("actions", {}))
+
+        if template.get("music"):
+            music_index = self.music.findData(template["music"])
+            self.music.setCurrentIndex(max(0, music_index))
+
+        if "phases" in template:
+            self.set_phases(template["phases"])
+
+        self.update_ai_fields()
+        self.update_action_fields()
+        self.refresh_issues()
+
+    def apply_stats(self, stats):
+        widgets = {
+            "life_max": self.life_max,
+            "damage": self.damage,
+            "defense": self.defense,
+            "knockback_resist": self.knockback_resist,
+            "width": self.width,
+            "height": self.height,
+            "scale": self.scale,
+            "value_copper": self.value,
+            "movement_speed": self.movement_speed,
+            "hover_height": self.hover_height,
+            "jump_force": self.jump_force,
+            "orbit_radius": self.orbit_radius,
+            "orbit_speed": self.orbit_speed,
+            "teleport_interval": self.teleport_interval,
+            "teleport_range": self.teleport_range,
+            "charge_speed": self.charge_speed,
+            "charge_pause": self.charge_pause,
+            "expert_life_percent": self.expert_life_percent,
+            "master_life_percent": self.master_life_percent,
+        }
+
+        for key, widget in widgets.items():
+            if key not in stats:
+                continue
+
+            value = stats[key]
+
+            if isinstance(widget, QDoubleSpinBox):
+                widget.setValue(float(value))
+            else:
+                widget.setValue(int(value))
+
+        if "ai" in stats:
+            ai_index = self.ai.findData(stats["ai"])
+            self.ai.setCurrentIndex(max(0, ai_index))
+
+    def apply_actions(self, actions):
+        dash = _as_dict(actions.get("dash"))
+        shoot = _as_dict(actions.get("shoot"))
+        adds = _as_dict(actions.get("summon"))
+
+        if dash:
+            if "enabled" in dash:
+                self.dash_enabled.setChecked(bool(dash["enabled"]))
+            if "interval_ticks" in dash:
+                self.dash_interval.setValue(int(dash["interval_ticks"]))
+            if "speed" in dash:
+                self.dash_speed.setValue(float(dash["speed"]))
+            if "duration_ticks" in dash:
+                self.dash_duration.setValue(int(dash["duration_ticks"]))
+            if "expert_only" in dash:
+                self.dash_expert_only.setChecked(bool(dash["expert_only"]))
+
+        if shoot:
+            if "enabled" in shoot:
+                self.shoot_enabled.setChecked(bool(shoot["enabled"]))
+            if "interval_ticks" in shoot:
+                self.shoot_interval.setValue(int(shoot["interval_ticks"]))
+            if "pattern" in shoot:
+                pattern_index = self.shoot_pattern.findData(
+                    shoot["pattern"]
+                )
+                self.shoot_pattern.setCurrentIndex(max(0, pattern_index))
+            if "source" in shoot:
+                source_index = self.shoot_source.findData(shoot["source"])
+                self.shoot_source.setCurrentIndex(max(0, source_index))
+            if "projectile" in shoot:
+                projectile_index = self.shoot_projectile.findData(
+                    shoot["projectile"]
+                )
+                self.shoot_projectile.setCurrentIndex(
+                    max(0, projectile_index)
+                )
+            if "damage" in shoot:
+                self.shoot_damage.setValue(int(shoot["damage"]))
+            if "count" in shoot:
+                self.shoot_count.setValue(int(shoot["count"]))
+            if "spread_degrees" in shoot:
+                self.shoot_spread.setValue(float(shoot["spread_degrees"]))
+            if "speed" in shoot:
+                self.shoot_speed.setValue(float(shoot["speed"]))
+            if "spiral_step" in shoot:
+                self.shoot_spiral_step.setValue(
+                    float(shoot["spiral_step"])
+                )
+            if "radius" in shoot:
+                self.shoot_radius.setValue(int(shoot["radius"]))
+            if "homing" in shoot:
+                self.shoot_homing.setValue(float(shoot["homing"]))
+            if "pierce" in shoot:
+                self.shoot_pierce.setValue(int(shoot["pierce"]))
+            if "lifetime_ticks" in shoot:
+                self.shoot_lifetime.setValue(int(shoot["lifetime_ticks"]))
+            if "color" in shoot:
+                color = QColor(str(shoot["color"]))
+
+                if color.isValid():
+                    self.shoot_color = color
+                    self.update_shoot_color_button()
+            if "expert_only" in shoot:
+                self.shoot_expert_only.setChecked(
+                    bool(shoot["expert_only"])
+                )
+
+        if adds:
+            if "enabled" in adds:
+                self.adds_enabled.setChecked(bool(adds["enabled"]))
+            if "interval_ticks" in adds:
+                self.adds_interval.setValue(int(adds["interval_ticks"]))
+            if "npc" in adds:
+                npc_index = self.adds_npc.findData(adds["npc"])
+                self.adds_npc.setCurrentIndex(max(0, npc_index))
+            if "count" in adds:
+                self.adds_count.setValue(int(adds["count"]))
+            if "expert_only" in adds:
+                self.adds_expert_only.setChecked(
+                    bool(adds["expert_only"])
+                )
+
+        self.update_action_fields()
+
+    def focus_first_field(self):
+        """Ставит курсор в название — удобно сразу после создания."""
+
+        self.tabs.setCurrentIndex(0)
+        self.name.setFocus()
+        self.name.selectAll()
+
+    def show_sprite_tab(self):
+        """Открывает вкладку спрайта — так делает менеджер ресурсов."""
+
+        self.tabs.setCurrentIndex(self.tabs.indexOf(self.sprite_tab))
+
+    def on_tab_changed(self, _index):
+        self.refresh_issues()
+
+    def update_preview_state(self, _index):
+        state = self.preview_state.currentData()
+
+        if state:
+            self.preview.set_state(state)
+
+    # --------------------------------------------------------
+    # CHECKS
+    # --------------------------------------------------------
+
+    def schedule_issue_check(self, *_):
+        if self.loading:
+            return
+
+        self.issue_timer.start()
+
+    def refresh_issues(self):
+        """Считает замечания по текущей форме и обновляет предпросмотр."""
+
+        if self.loading or not self.tabs.isEnabled():
+            return
+
+        data = self.collect_data()
+        animations = self.animation_snapshot()
+
+        self.script_editor.set_context(
+            animated=boss_is_animated(animations),
+            extra_members=boss_generated_members(data),
+        )
+
+        issues = check_boss(
+            data.get("name") or data.get("internal_id") or "босс",
+            data,
+            self.sprite,
+            animations,
+        )
+
+        if issues:
+            first = issues[0]
+            more = f" и ещё {len(issues) - 1}" if len(issues) > 1 else ""
+            self.issues_label.setText(
+                f"Замечаний: {len(issues)} — {first}{more}"
+            )
+            self.issues_label.setStyleSheet(
+                f"color: {THEME['accent']}; padding: 4px 2px;"
+            )
+            self.issues_label.setToolTip("\n".join(issues))
+        else:
+            self.issues_label.setText("Проверка пройдена: замечаний нет.")
+            self.issues_label.setStyleSheet(
+                f"color: {THEME['muted']}; padding: 4px 2px;"
+            )
+            self.issues_label.setToolTip("")
+
+        self.preview.set_data(data, self.sprite, animations)
+        self.update_preview_state(self.preview_state.currentIndex())
+        self.changed.emit(data, str(data.get("internal_id") or ""))
+
+    # --------------------------------------------------------
+    # LOOT
+    # --------------------------------------------------------
+
+    def add_loot_row(
+        self,
+        item_id=None,
+        chance=0.25,
+        min_amount=1,
+        max_amount=1,
+        expert=False,
+    ):
+        if not self.item_choices and not item_id:
+            return
+
+        row = self.loot_table.rowCount()
+        self.loot_table.insertRow(row)
+
+        combo = QComboBox()
+
+        for key, name in self.item_choices:
+            combo.addItem(name, key)
+
+        if item_id:
+            index = combo.findData(item_id)
+
+            if index < 0:
+                combo.addItem(f"{item_id} (нет в проекте)", item_id)
+                index = combo.count() - 1
+
+            combo.setCurrentIndex(index)
+
+        chance_box = QDoubleSpinBox()
+        chance_box.setRange(0.0, 100.0)
+        chance_box.setDecimals(1)
+        chance_box.setSingleStep(5.0)
+        chance_box.setSuffix(" %")
+        chance_box.setValue(max(0.0, min(100.0, chance * 100.0)))
+
+        min_box = QSpinBox()
+        min_box.setRange(1, 9999)
+        min_box.setValue(max(1, int(min_amount)))
+
+        max_box = QSpinBox()
+        max_box.setRange(1, 9999)
+        max_box.setValue(max(int(min_amount), int(max_amount)))
+
+        self.loot_table.setCellWidget(row, 0, combo)
+        self.loot_table.setCellWidget(row, 1, chance_box)
+        self.loot_table.setCellWidget(row, 2, min_box)
+        self.loot_table.setCellWidget(row, 3, max_box)
+
+        expert_host = QWidget()
+        expert_layout = QHBoxLayout(expert_host)
+        expert_layout.setContentsMargins(0, 0, 0, 0)
+        expert_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        expert_box = QCheckBox()
+        expert_box.setChecked(bool(expert))
+        expert_box.setToolTip(
+            "Дроп только в эксперте и мастере."
+        )
+        expert_layout.addWidget(expert_box)
+        self.loot_table.setCellWidget(row, 4, expert_host)
+
+        combo.currentIndexChanged.connect(self.schedule_issue_check)
+        chance_box.valueChanged.connect(self.schedule_issue_check)
+        min_box.valueChanged.connect(self.schedule_issue_check)
+        max_box.valueChanged.connect(self.schedule_issue_check)
+        expert_box.toggled.connect(self.schedule_issue_check)
+
+    def remove_loot_row(self):
+        row = self.loot_table.currentRow()
+
+        if row >= 0:
+            self.loot_table.removeRow(row)
+            self.schedule_issue_check()
+
+    def set_loot(self, loot):
+        self.loot_table.setRowCount(0)
+
+        for entry in loot:
+            if not isinstance(entry, dict):
+                continue
+
+            item_id = entry.get("item")
+
+            if not isinstance(item_id, str) or not item_id:
+                continue
+
+            try:
+                chance = float(entry.get("chance", 0.25))
+            except (TypeError, ValueError):
+                chance = 0.25
+
+            try:
+                min_amount = int(entry.get("min", 1))
+            except (TypeError, ValueError):
+                min_amount = 1
+
+            try:
+                max_amount = int(entry.get("max", min_amount))
+            except (TypeError, ValueError):
+                max_amount = min_amount
+
+            self.add_loot_row(
+                item_id,
+                chance,
+                max(1, min_amount),
+                max(1, max_amount),
+                bool(entry.get("expert", False)),
+            )
+
+    def get_loot(self):
+        loot = []
+
+        for row in range(self.loot_table.rowCount()):
+            combo = self.loot_table.cellWidget(row, 0)
+            chance_box = self.loot_table.cellWidget(row, 1)
+            min_box = self.loot_table.cellWidget(row, 2)
+            max_box = self.loot_table.cellWidget(row, 3)
+            expert_host = self.loot_table.cellWidget(row, 4)
+
+            if not isinstance(combo, QComboBox) or not isinstance(
+                chance_box, QDoubleSpinBox
+            ):
+                continue
+
+            item_id = combo.currentData()
+
+            if not item_id:
+                continue
+
+            min_amount = max(1, min_box.value())
+            max_amount = max(min_amount, max_box.value())
+
+            expert_box = (
+                expert_host.findChild(QCheckBox)
+                if expert_host is not None
+                else None
+            )
+
+            loot.append({
+                "item": item_id,
+                "chance": chance_box.value() / 100.0,
+                "min": min_amount,
+                "max": max_amount,
+                "expert": bool(
+                    expert_box is not None and expert_box.isChecked()
+                ),
+            })
+
+        return loot
+
+    # --------------------------------------------------------
+    # PHASES
+    # --------------------------------------------------------
+
+    def add_phase_row(
+        self,
+        name="Фаза",
+        threshold=1.0,
+        speed_multiplier=1.0,
+        attack_multiplier=1.0,
+    ):
+        row = self.phase_table.rowCount()
+
+        if row >= MAX_BOSS_PHASES:
+            return
+
+        self.phase_table.insertRow(row)
+
+        name_edit = QLineEdit(str(name))
+        name_edit.setPlaceholderText(f"Фаза {row + 1}")
+
+        threshold_box = QDoubleSpinBox()
+        threshold_box.setRange(1.0, 100.0)
+        threshold_box.setDecimals(0)
+        threshold_box.setSingleStep(5.0)
+        threshold_box.setSuffix(" %")
+        threshold_box.setValue(
+            max(1.0, min(100.0, float(threshold) * 100.0))
+        )
+
+        speed_box = QDoubleSpinBox()
+        speed_box.setRange(0.1, 5.0)
+        speed_box.setDecimals(2)
+        speed_box.setSingleStep(0.05)
+        speed_box.setPrefix("× ")
+        speed_box.setValue(max(0.1, min(5.0, float(speed_multiplier))))
+
+        attack_box = QDoubleSpinBox()
+        attack_box.setRange(0.1, 5.0)
+        attack_box.setDecimals(2)
+        attack_box.setSingleStep(0.05)
+        attack_box.setPrefix("× ")
+        attack_box.setValue(
+            max(0.1, min(5.0, float(attack_multiplier)))
+        )
+
+        self.phase_table.setCellWidget(row, 0, name_edit)
+        self.phase_table.setCellWidget(row, 1, threshold_box)
+        self.phase_table.setCellWidget(row, 2, speed_box)
+        self.phase_table.setCellWidget(row, 3, attack_box)
+
+        name_edit.textChanged.connect(self.schedule_issue_check)
+        threshold_box.valueChanged.connect(self.schedule_issue_check)
+        speed_box.valueChanged.connect(self.schedule_issue_check)
+        attack_box.valueChanged.connect(self.schedule_issue_check)
+
+        self.refresh_phase_rows()
+
+    def refresh_phase_rows(self):
+        """Первая фаза всегда 100% и не редактируется."""
+
+        for row in range(self.phase_table.rowCount()):
+            threshold_box = self.phase_table.cellWidget(row, 1)
+
+            if not isinstance(threshold_box, QDoubleSpinBox):
+                continue
+
+            if row == 0:
+                threshold_box.blockSignals(True)
+                threshold_box.setValue(100.0)
+                threshold_box.blockSignals(False)
+                threshold_box.setEnabled(False)
+                threshold_box.setToolTip("Первая фаза всегда активна.")
+            else:
+                threshold_box.setEnabled(True)
+                threshold_box.setToolTip("")
+
+        self.remove_phase_btn.setEnabled(
+            self.phase_table.rowCount() > 1
+        )
+        self.add_phase_btn.setEnabled(
+            self.phase_table.rowCount() < MAX_BOSS_PHASES
+        )
+        self.update_phase_hint()
+
+    def remove_phase_row(self):
+        row = self.phase_table.currentRow()
+
+        if row <= 0 or self.phase_table.rowCount() <= 1:
+            return
+
+        self.phase_table.removeRow(row)
+        self.refresh_phase_rows()
+        self.schedule_issue_check()
+
+    def reset_phases(self):
+        self.set_phases(None)
+        self.schedule_issue_check()
+
+    def update_phase_hint(self):
+        count = self.phase_table.rowCount()
+
+        if count <= 1:
+            self.phase_hint.setText(
+                "Одна фаза: босс ведёт себя одинаково до самой смерти. "
+                "Добавь вторую фазу, чтобы он ускорялся на низком здоровье."
+            )
+        else:
+            self.phase_hint.setText(
+                f"Фаз: {count}. Первая действует от 100% здоровья, "
+                "каждая следующая включается на своём пороге. Генератор "
+                "подставит множители в скорость и интервалы атак."
+            )
+
+    def set_phases(self, phases):
+        self.phase_table.setRowCount(0)
+
+        # Показываем то, что реально лежит в проекте (в безопасных
+        # границах): порог первой фазы всё равно принудительно 100%.
+        source = _as_list(phases)
+        entries = []
+
+        for entry in source:
+            if not isinstance(entry, dict):
+                continue
+
+            entries.append({
+                "name": str(entry.get("name") or ""),
+                "threshold": _clamped_float(
+                    entry.get("threshold"), 1.0, 0.0, 1.0
+                ),
+                "speed_multiplier": _clamped_float(
+                    entry.get("speed_multiplier"), 1.0, 0.1, 5.0
+                ),
+                "attack_multiplier": _clamped_float(
+                    entry.get("attack_multiplier"), 1.0, 0.1, 5.0
+                ),
+            })
+
+        if not entries:
+            entries = [dict(DEFAULT_PHASE)]
+
+        for index, entry in enumerate(entries[:MAX_BOSS_PHASES], 1):
+            self.add_phase_row(
+                entry["name"] or f"Фаза {index}",
+                entry["threshold"],
+                entry["speed_multiplier"],
+                entry["attack_multiplier"],
+            )
+
+        self.refresh_phase_rows()
+
+    def get_phases(self):
+        phases = []
+
+        for row in range(self.phase_table.rowCount()):
+            name_edit = self.phase_table.cellWidget(row, 0)
+            threshold_box = self.phase_table.cellWidget(row, 1)
+            speed_box = self.phase_table.cellWidget(row, 2)
+            attack_box = self.phase_table.cellWidget(row, 3)
+
+            if not isinstance(threshold_box, QDoubleSpinBox):
+                continue
+
+            name = (
+                name_edit.text().strip()
+                if isinstance(name_edit, QLineEdit)
+                else ""
+            )
+
+            phases.append({
+                "name": name or f"Фаза {row + 1}",
+                "threshold": (
+                    1.0 if row == 0 else threshold_box.value() / 100.0
+                ),
+                "speed_multiplier": (
+                    speed_box.value()
+                    if isinstance(speed_box, QDoubleSpinBox)
+                    else 1.0
+                ),
+                "attack_multiplier": (
+                    attack_box.value()
+                    if isinstance(attack_box, QDoubleSpinBox)
+                    else 1.0
+                ),
+            })
+
+        if not phases:
+            phases = [dict(DEFAULT_PHASE)]
+
+        return phases
+
+    # --------------------------------------------------------
+    # SPRITE
+    # --------------------------------------------------------
+
+    def choose_sprite(self):
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбрать спрайт босса",
+            "",
+            "Изображения (*.png *.webp *.bmp *.jpg *.jpeg)",
+        )
+
+        if not filename:
+            return
+
+        candidate = QImage(filename)
+
+        if candidate.isNull():
+            QMessageBox.warning(
+                self, "Ошибка", "Не удалось открыть изображение."
+            )
+            return
+
+        self.sprite = candidate
+        self.refresh_sprite()
+        self.schedule_issue_check()
+
+    def set_sprite(self, image):
+        """Спрайт из менеджера ресурсов."""
+
+        self.sprite = image.copy()
+        self.refresh_sprite()
+        self.schedule_issue_check()
+
+    def fit_hitbox_to_sprite(self):
+        """Ставит хитбокс по размеру текущего спрайта."""
+
+        if self.sprite.isNull():
+            QMessageBox.information(
+                self,
+                "Нет спрайта",
+                "Сначала выбери изображение босса.",
+            )
+            return
+
+        self.width.setValue(max(8, min(1024, self.sprite.width())))
+        self.height.setValue(max(8, min(1024, self.sprite.height())))
+
+    def fit_hitbox_to_art(self):
+        """Хитбокс по непрозрачным пикселям, без прозрачных полей."""
+
+        if self.sprite.isNull():
+            QMessageBox.information(
+                self,
+                "Нет спрайта",
+                "Сначала выбери изображение босса.",
+            )
+            return
+
+        bounds = opaque_bounds(self.sprite)
+
+        if bounds is None:
+            QMessageBox.information(
+                self,
+                "Пустой спрайт",
+                "На изображении нет непрозрачных пикселей.",
+            )
+            return
+
+        x0, y0, x1, y1 = bounds
+        self.width.setValue(max(8, min(1024, x1 - x0 + 1)))
+        self.height.setValue(max(8, min(1024, y1 - y0 + 1)))
+
+    def refresh_sprite(self):
+        if self.sprite.isNull():
+            self.sprite_preview.setPixmap(QPixmap())
+            self.sprite_preview.setText("Нет спрайта")
+            self.sprite_info.setText("Спрайт не выбран")
+            return
+
+        pixmap = QPixmap.fromImage(self.sprite).scaled(
+            240,
+            240,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+
+        self.sprite_preview.setPixmap(pixmap)
+        self.sprite_preview.setText("")
+
+        info = f"{self.sprite.width()} × {self.sprite.height()} px"
+        bounds = opaque_bounds(self.sprite)
+
+        if bounds is not None:
+            x0, y0, x1, y1 = bounds
+            info += f" · рисунок {x1 - x0 + 1} × {y1 - y0 + 1}"
+
+        self.sprite_info.setText(info)
+
+
+def _set_row_visible(form, widget, visible):
+    """Скрывает строку формы целиком (или только поле в старом Qt)."""
+
+    try:
+        form.setRowVisible(widget, bool(visible))
+    except (AttributeError, TypeError):
+        widget.setVisible(bool(visible))
